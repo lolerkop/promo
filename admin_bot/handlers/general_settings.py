@@ -19,7 +19,12 @@ TEMPLATE_PATTERN = re.compile(r'^(?:\d+\[[^\]\n]+\](?:\n|\s)?)+$')
 
 def general_settings_menu_keyboard() -> InlineKeyboardMarkup:
 	subscription_mode = get_config_value("subscription_mode", "all_accounts")
-	sub_mode_text = "Все аккаунты" if subscription_mode == "all_accounts" else "1 сущность - 1 аккаунт"
+	subscription_mode_names = {
+		"all_accounts": "Все аккаунты",
+		"single_account_sticky": "1 сущность - 1 аккаунт",
+		"one_entity_five_accounts": "1 на 5",
+	}
+	sub_mode_text = subscription_mode_names.get(subscription_mode, subscription_mode_names["all_accounts"])
 
 	listen_all_mode = get_config_value("listen_all", "True").lower() == 'true'
 	listen_all_text = "Все чаты" if listen_all_mode else "Только из БД"
@@ -138,7 +143,11 @@ async def cb_toggle_subscription_mode(callback: CallbackQuery, state: FSMContext
 		return
 
 	current_mode = get_config_value("subscription_mode", "all_accounts")
-	new_mode = "single_account_sticky" if current_mode == "all_accounts" else "all_accounts"
+	mode_order = ["all_accounts", "single_account_sticky", "one_entity_five_accounts"]
+	try:
+		new_mode = mode_order[(mode_order.index(current_mode) + 1) % len(mode_order)]
+	except ValueError:
+		new_mode = "all_accounts"
 	set_config_value("subscription_mode", new_mode)
 
 	logging.info(f"Subscription mode changed to: {new_mode} by admin {callback.from_user.id}")

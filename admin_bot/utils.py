@@ -42,6 +42,7 @@ FATAL_ACCOUNT_ERRORS = (
 )
 
 channel_join_rate_state = {}
+subscription_runtime_loads: dict[int, int] = {}
 
 
 def _progress_bar(done: int, total: int, width: int = 18) -> str:
@@ -400,6 +401,52 @@ async def join_group_with_client(client: TelegramClient, link_or_username: str, 
         raise e
 
 
+def _get_subscription_accounts_per_entity() -> int:
+    return _get_int_config_value("subscription_accounts_per_entity", 5, 1)
+
+
+def _get_account_subscription_loads() -> dict[int, int]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    loads: dict[int, int] = {}
+    try:
+        cursor.execute("""
+            SELECT account_id, SUM(cnt) AS total_count
+            FROM (
+                SELECT assigned_account_id AS account_id, COUNT(*) AS cnt
+                FROM channels
+                WHERE assigned_account_id IS NOT NULL
+                GROUP BY assigned_account_id
+                UNION ALL
+                SELECT assigned_account_id AS account_id, COUNT(*) AS cnt
+                FROM groups
+                WHERE assigned_account_id IS NOT NULL
+                GROUP BY assigned_account_id
+            )
+            GROUP BY account_id
+        """)
+        loads = {int(row["account_id"]): int(row["total_count"] or 0) for row in cursor.fetchall()}
+    except Exception as e:
+        logging.warning(f"Could not load account subscription balance: {e}")
+    finally:
+        conn.close()
+    return loads
+
+
+def _order_clients_for_balanced_subscription(clients_pool: list[tuple[TelegramClient, dict]], runtime_loads: dict[int, int] | None = None):
+    db_loads = _get_account_subscription_loads()
+    runtime_loads = runtime_loads or {}
+    return sorted(
+        clients_pool,
+        key=lambda item: (
+            db_loads.get(item[1].get("id"), 0)
+            + subscription_runtime_loads.get(item[1].get("id"), 0)
+            + runtime_loads.get(item[1].get("id"), 0),
+            item[1].get("id") or 0,
+        )
+    )
+
+
 async def leave_group_with_client(client: TelegramClient, chat_id_or_entity: int | str):
     userbot_clients_list = get_active_clients()
     try:
@@ -565,6 +612,42 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
                 stats['failed'] += 1
                 logging.error(f"Непредвиденная ошибка при присоединении '{label}' к '{identifier}': {e}", exc_info=True)
                 break
+
+    elif subscription_mode == "one_entity_five_accounts":
+        target_successes = min(_get_subscription_accounts_per_entity(), len(clients_to_try))
+        ordered_clients = _order_clients_for_balanced_subscription(clients_to_try)
+        runtime_loads: dict[int, int] = {}
+        for client, client_data in ordered_clients:
+            if stats['success'] >= target_successes:
+                break
+
+            label = client_data.get('label', 'N/A')
+            account_id = client_data.get("id")
+            try:
+                await join_group_with_client(client, identifier)
+                stats['success'] += 1
+                runtime_loads[account_id] = runtime_loads.get(account_id, 0) + 1
+                subscription_runtime_loads[account_id] = subscription_runtime_loads.get(account_id, 0) + 1
+                if assigned_account_id is None:
+                    assigned_account_id = account_id
+
+            except FATAL_ACCOUNT_ERRORS as e:
+                logging.warning(f"РђРєРєР°СѓРЅС‚ '{label}' РЅРµР°РєС‚РёРІРµРЅ (РџСЂРёС‡РёРЅР°: {type(e).__name__}). РЈРґР°Р»СЏСЋ.")
+                await handle_banned_account(client_data, e, admin_chat_id)
+                stats['deleted'] += 1
+
+            except UserAlreadyParticipantError:
+                stats['success'] += 1
+                runtime_loads[account_id] = runtime_loads.get(account_id, 0) + 1
+                subscription_runtime_loads[account_id] = subscription_runtime_loads.get(account_id, 0) + 1
+                if assigned_account_id is None:
+                    assigned_account_id = account_id
+
+            except Exception as e:
+                stats['failed'] += 1
+                logging.warning(f"РќРµ СѓРґР°Р»РѕСЃСЊ РїСЂРёСЃРѕРµРґРёРЅРёС‚СЊ '{label}' Рє '{identifier}': {type(e).__name__} - {e}")
+
+            await asyncio.sleep(random.uniform(0.5, 1.5))
 
     else:
         for client, client_data in clients_to_try:
@@ -916,12 +999,14 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                     await join_group_with_client(client, identifier, wait_on_flood=False)
                     total_stats['success'] += 1
                     account_state[account_id]['success'] += 1
+                    subscription_runtime_loads[account_id] = subscription_runtime_loads.get(account_id, 0) + 1
                     await mark_attempt(account_id, "successful join")
                     await asyncio.sleep(random.uniform(attempt_gap_min, attempt_gap_max))
                     return True, False
                 except UserAlreadyParticipantError:
                     total_stats['success'] += 1
                     account_state[account_id]['success'] += 1
+                    subscription_runtime_loads[account_id] = subscription_runtime_loads.get(account_id, 0) + 1
                     await mark_attempt(account_id, "already participant")
                     await asyncio.sleep(random.uniform(attempt_gap_min, attempt_gap_max))
                     return True, False
@@ -987,6 +1072,28 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                                 info_client = client
                             elif retry_later:
                                 continue
+                    elif subscription_mode == "one_entity_five_accounts":
+                        target_successes = min(_get_subscription_accounts_per_entity(), len(clients_pool))
+                        success_count_for_entity = 0
+                        runtime_loads = {
+                            data.get('id'): account_state[data.get('id')]['success']
+                            for _, data in clients_pool
+                        }
+                        ordered_clients = _order_clients_for_balanced_subscription(clients_pool, runtime_loads)
+                        for client, client_data in ordered_clients:
+                            if success_count_for_entity >= target_successes:
+                                break
+                            account_id = client_data.get('id')
+                            await wait_for_account(account_id)
+                            if not client.is_connected():
+                                continue
+                            ok, _ = await try_join_with_account(client, client_data, ident_str)
+                            if ok:
+                                success_count_for_entity += 1
+                                joined_by_any = True
+                                info_client = info_client or client
+                                if assigned_id is None:
+                                    assigned_id = account_id
                     else:
                         for client, client_data in list(clients_pool):
                             account_id = client_data.get('id')

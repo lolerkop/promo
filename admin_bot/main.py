@@ -67,6 +67,7 @@ async def main_bot_polling_task():
 		"ai_welcome_message_prompt": "Приветствуем в нашем чате! Рады видеть вас здесь. Расскажите немного о себе или задавайте вопросы!",
 		"welcome_message_enabled": "False",
 		"subscription_mode": "all_accounts",
+		"subscription_accounts_per_entity": "5",
 		"use_ai": "True"
 	}
 	for key, value in default_configs.items():
