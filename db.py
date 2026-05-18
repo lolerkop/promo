@@ -1,0 +1,578 @@
+import logging
+import os
+import sqlite3
+from datetime import datetime, timezone
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_PATH = os.getenv("DB_PATH", "data/database.sqlite")
+
+
+def get_db_connection():
+	conn = sqlite3.connect(DB_PATH)
+	conn.row_factory = sqlite3.Row
+	return conn
+
+
+def create_tables():
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS accounts (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_name TEXT UNIQUE,
+		phone TEXT,
+		api_id INTEGER,
+		api_hash TEXT,
+		label TEXT,
+		user_id INTEGER,
+		proxy_type TEXT,
+		proxy_ip TEXT,
+		proxy_port INTEGER,
+		proxy_username TEXT,
+		proxy_password TEXT
+	)
+	""")
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS groups (
+		id INTEGER PRIMARY KEY,
+		username TEXT,
+		title TEXT,
+		enabled INTEGER DEFAULT 1,
+		assigned_account_id INTEGER DEFAULT NULL REFERENCES accounts(id) ON DELETE SET NULL
+	)
+	""")
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS channels (
+		id INTEGER PRIMARY KEY,
+		username TEXT,
+		title TEXT,
+		enabled INTEGER DEFAULT 1,
+		linked_chat_id TEXT,
+		assigned_account_id INTEGER DEFAULT NULL REFERENCES accounts(id) ON DELETE SET NULL
+	)
+	""")
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS responses (
+		keyword TEXT PRIMARY KEY,
+		answer TEXT,
+		response_type TEXT
+	)
+	""")
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS config (
+		key TEXT PRIMARY KEY,
+		value TEXT
+	)
+	""")
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS cycle_state (
+		cycle_name TEXT PRIMARY KEY,
+		last_account_index INTEGER
+	)
+	""")
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS analytics_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+		account_id INTEGER,
+		action_type TEXT,
+		details TEXT,
+		success INTEGER,
+		FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+	)
+	""")
+
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS chat_categories (
+		category_name TEXT PRIMARY KEY,
+		is_active INTEGER DEFAULT 0,
+		prompt TEXT,
+		chats_to_join_count INTEGER DEFAULT 5,
+		join_intensity_per_hour INTEGER DEFAULT 10,
+		regular_comment_enabled INTEGER DEFAULT 0,
+		regular_comment_interval_minutes INTEGER DEFAULT 60,
+		regular_comment_prompt TEXT
+	)
+	""")
+
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS category_joined_chats (
+		category_name TEXT NOT NULL,
+		chat_id INTEGER NOT NULL,
+		account_db_id INTEGER NOT NULL,
+		chat_link TEXT,
+		PRIMARY KEY (category_name, chat_id, account_db_id),
+		FOREIGN KEY (category_name) REFERENCES chat_categories(category_name) ON DELETE CASCADE,
+		FOREIGN KEY (account_db_id) REFERENCES accounts(id) ON DELETE CASCADE
+	)
+	""")
+
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS category_keywords (
+		category_name TEXT NOT NULL,
+		keyword TEXT NOT NULL,
+		answer TEXT,
+		response_type TEXT NOT NULL,
+		PRIMARY KEY (category_name, keyword),
+		FOREIGN KEY (category_name) REFERENCES chat_categories(category_name) ON DELETE CASCADE
+	)
+	""")
+
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS templates (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		templates TEXT NOT NULL
+	)
+	""")
+
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS openai_api_keys (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		api_key TEXT UNIQUE NOT NULL,
+		is_active INTEGER DEFAULT 1,
+		last_used_timestamp DATETIME,
+		last_failed_timestamp DATETIME,
+		failure_count INTEGER DEFAULT 0,
+		custom_label TEXT
+	)
+	""")
+	c.execute("""
+		CREATE TABLE IF NOT EXISTS sessions (
+			session_id TEXT PRIMARY KEY,
+			dc_id INTEGER NOT NULL,
+			server_address TEXT,
+			port INTEGER,
+			auth_key BLOB NOT NULL,
+			takeout_id INTEGER
+		)
+	""")
+	c.execute("""
+		CREATE TABLE IF NOT EXISTS proxies (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			proxy_type TEXT DEFAULT 'socks5',
+			proxy_ip TEXT NOT NULL,
+			proxy_port INTEGER NOT NULL,
+			proxy_username TEXT,
+			proxy_password TEXT,
+			assigned_account_id INTEGER UNIQUE REFERENCES accounts(id) ON DELETE SET NULL,
+			UNIQUE(proxy_ip, proxy_port)
+		)
+	""")
+	conn.commit()
+	conn.close()
+
+
+def _add_column_if_not_exists(table_name, column_name, column_def):
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute(f"PRAGMA table_info({table_name})")
+		columns = [row['name'] for row in c.fetchall()]
+		if column_name not in columns:
+			c.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+			logging.info(f"Added column {column_name} to table {table_name}")
+		else:
+			logging.debug(f"Column {column_name} already exists in table {table_name}")
+	except Exception as e:
+		logging.error(f"Error adding column {column_name} to {table_name}: {e}")
+	finally:
+		conn.commit()
+		conn.close()
+
+
+def update_all_tables():
+	create_tables()
+	_add_column_if_not_exists("groups", "assigned_account_id",
+							  "INTEGER DEFAULT NULL REFERENCES accounts(id) ON DELETE SET NULL")
+	_add_column_if_not_exists("channels", "assigned_account_id",
+							  "INTEGER DEFAULT NULL REFERENCES accounts(id) ON DELETE SET NULL")
+	_add_column_if_not_exists("chat_categories", "regular_comment_enabled", "INTEGER DEFAULT 0")
+	_add_column_if_not_exists("chat_categories", "regular_comment_interval_minutes", "INTEGER DEFAULT 60")
+	_add_column_if_not_exists("chat_categories", "regular_comment_prompt", "TEXT")
+
+
+def set_config_value(key: str, value: str):
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
+	conn.commit()
+	conn.close()
+
+
+def get_config_value(key: str, default_value: str = None) -> str:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("SELECT value FROM config WHERE key=?", (key,))
+	row = c.fetchone()
+	conn.close()
+	if row:
+		return row["value"]
+	return default_value
+
+def set_template(template_str: str):
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("INSERT OR REPLACE INTO templates (id, templates) VALUES (?, ?)", (1, template_str,))
+	conn.commit()
+	conn.close()
+
+def get_templates() -> str | None:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("SELECT templates FROM templates WHERE id=1")
+	row = c.fetchone()
+	conn.close()
+	if row:
+		return row['templates']
+	return None
+
+def add_analytics_log(account_id: int = None, action_type: str = None, details: str = None,
+					  success: bool = True):
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute(
+			"INSERT INTO analytics_log (account_id, action_type, details, success, timestamp) VALUES (?, ?, ?, ?, ?)",
+			(account_id, action_type, details, 1 if success else 0, datetime.now(timezone.utc))
+		)
+		conn.commit()
+	except Exception as e:
+		print(f"Error logging analytics: {e}")
+	finally:
+		conn.close()
+
+
+def get_analytics_summary(start_date: datetime, end_date: datetime):
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("""
+		SELECT action_type, success, COUNT(*) as count
+		FROM analytics_log
+		WHERE timestamp BETWEEN ? AND ?
+		GROUP BY action_type, success
+	""", (start_date, end_date))
+	summary = c.fetchall()
+	conn.close()
+	return summary
+
+
+def clear_analytics_logs():
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("DELETE FROM analytics_log")
+		conn.commit()
+		return True
+	except Exception as e:
+		print(f"Error clearing analytics_log: {e}")
+		return False
+	finally:
+		conn.close()
+
+
+def get_active_category_prompt_for_chat(chat_id: int) -> str | None:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("""
+		SELECT cc.prompt
+		FROM category_joined_chats cjc
+		JOIN chat_categories cc ON cjc.category_name = cc.category_name
+		WHERE cjc.chat_id = ? AND cc.is_active = 1 AND cc.prompt IS NOT NULL AND cc.prompt != ''
+		LIMIT 1
+	""", (chat_id,))
+	row = c.fetchone()
+	conn.close()
+	if row:
+		return row["prompt"]
+	return None
+
+
+def unassign_proxy_for_account(account_id: int):
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("UPDATE proxies SET assigned_account_id = NULL WHERE assigned_account_id = ?", (account_id,))
+		conn.commit()
+		logging.info(f"Proxy unassigned for account_id: {account_id}")
+	except Exception as e:
+		logging.error(f"Error unassigning proxy for account {account_id}: {e}")
+		conn.rollback()
+	finally:
+		conn.close()
+
+
+async def remove_telethon_account(acc_id: int) -> str:
+	from userbot import remove_client_from_runtime
+	unassign_proxy_for_account(acc_id)
+
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("SELECT session_name, user_id FROM accounts WHERE id=?", (acc_id,))
+	row = c.fetchone()
+	if not row:
+		conn.close()
+		return f"Аккаунт с ID={acc_id} не найден."
+
+	session_name = row["session_name"]
+
+	c.execute("DELETE FROM accounts WHERE id=?", (acc_id,))
+	c.execute("DELETE FROM category_joined_chats WHERE account_db_id=?", (acc_id,))
+	c.execute("DELETE FROM sessions WHERE session_id=?", (session_name,))
+	conn.commit()
+	conn.close()
+
+	await remove_client_from_runtime(acc_id, session_name)
+
+	try:
+		session_file_path = os.path.join("sessions", f"{session_name}.session")
+		if os.path.exists(session_file_path):
+			os.remove(session_file_path)
+
+		session_journal_path = f"{session_file_path}-journal"
+		if os.path.exists(session_journal_path):
+			os.remove(session_journal_path)
+
+		return f"Аккаунт (session={session_name}, id={acc_id}) удалён из БД, runtime и файл сессии стерт."
+	except Exception as e:
+		logging.error(f"Could not remove session file for {session_name}: {e}")
+		return f"Аккаунт (session={session_name}, id={acc_id}) удалён из БД и runtime, но не удалось удалить файл сессии."
+
+
+def get_category_keywords(category_name: str) -> list:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("SELECT keyword, answer, response_type FROM category_keywords WHERE category_name = ?", (category_name,))
+	rows = c.fetchall()
+	conn.close()
+	return [dict(row) for row in rows]
+
+
+def add_category_keyword(category_name: str, keyword: str, answer: str, response_type: str):
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute(
+		"INSERT OR REPLACE INTO category_keywords (category_name, keyword, answer, response_type) VALUES (?, ?, ?, ?)",
+		(category_name, keyword.lower(), answer, response_type))
+	conn.commit()
+	conn.close()
+
+
+def delete_category_keyword(category_name: str, keyword: str):
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("DELETE FROM category_keywords WHERE category_name = ? AND keyword = ?", (category_name, keyword.lower()))
+	conn.commit()
+	conn.close()
+
+
+def add_openai_api_key(api_key: str, custom_label: str = None) -> bool:
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("INSERT INTO openai_api_keys (api_key, custom_label, is_active, failure_count) VALUES (?, ?, 1, 0)",
+				  (api_key, custom_label if custom_label else None))
+		conn.commit()
+		return True
+	except sqlite3.IntegrityError:
+		return False
+	finally:
+		conn.close()
+
+
+def get_openai_api_keys() -> list:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute(
+		"SELECT id, api_key, is_active, last_used_timestamp, last_failed_timestamp, failure_count, custom_label FROM openai_api_keys ORDER BY id")
+	keys = [dict(row) for row in c.fetchall()]
+	conn.close()
+	return keys
+
+
+def get_active_openai_api_keys_for_cycle() -> list:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("""
+		SELECT id, api_key
+		FROM openai_api_keys
+		WHERE is_active = 1
+		ORDER BY
+			last_used_timestamp ASC,
+			failure_count ASC,
+			last_failed_timestamp ASC
+	""")
+	keys = [dict(row) for row in c.fetchall()]
+	conn.close()
+	return keys
+
+
+def delete_openai_api_key(key_id: int) -> bool:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("DELETE FROM openai_api_keys WHERE id = ?", (key_id,))
+	conn.commit()
+	deleted_rows = c.rowcount
+	conn.close()
+	return deleted_rows > 0
+
+
+def update_openai_api_key_status(key_id: int, is_active: bool) -> bool:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("UPDATE openai_api_keys SET is_active = ? WHERE id = ?", (1 if is_active else 0, key_id))
+	conn.commit()
+	updated_rows = c.rowcount
+	conn.close()
+	return updated_rows > 0
+
+
+def record_openai_key_usage(key_id: int):
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("UPDATE openai_api_keys SET last_used_timestamp = ? WHERE id = ?",
+			  (datetime.now(timezone.utc), key_id))
+	conn.commit()
+	conn.close()
+
+
+def record_openai_key_failure(key_id: int, temporarily_deactivate: bool = False):
+	conn = get_db_connection()
+	c = conn.cursor()
+	if temporarily_deactivate:
+		c.execute("""
+			UPDATE openai_api_keys
+			SET last_failed_timestamp = ?,
+				failure_count = failure_count + 1,
+				is_active = 0
+			WHERE id = ?
+		""", (datetime.now(timezone.utc), key_id))
+	else:
+		c.execute("""
+			UPDATE openai_api_keys
+			SET last_failed_timestamp = ?,
+				failure_count = failure_count + 1
+			WHERE id = ?
+		""", (datetime.now(timezone.utc), key_id))
+	conn.commit()
+	conn.close()
+
+
+def get_account_details(account_id: int) -> dict | None:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
+	row = c.fetchone()
+	conn.close()
+	return dict(row) if row else None
+
+
+def update_account_proxy_settings(account_id: int, proxy_details: dict) -> bool:
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("""
+			UPDATE accounts
+			SET proxy_type = ?, proxy_ip = ?, proxy_port = ?,
+				proxy_username = ?, proxy_password = ?
+			WHERE id = ?
+		""", (
+			proxy_details.get('proxy_type'),
+			proxy_details.get('proxy_ip'),
+			proxy_details.get('proxy_port'),
+			proxy_details.get('proxy_username'),
+			proxy_details.get('proxy_password'),
+			account_id
+		))
+		conn.commit()
+		return c.rowcount > 0
+	except Exception as e:
+		logging.error(f"Error updating proxy for account {account_id}: {e}")
+		conn.rollback()
+		return False
+	finally:
+		conn.close()
+
+
+def set_entity_assigned_account(entity_id: int, account_id: int, entity_type: str):
+	if entity_type not in ["group", "channel"]:
+		logging.error(f"Unknown entity type for assignment: {entity_type}")
+		return
+	table_name = "groups" if entity_type == "group" else "channels"
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute(f"UPDATE {table_name} SET assigned_account_id = ? WHERE id = ?", (account_id, entity_id))
+		conn.commit()
+		logging.info(f"Assigned account {account_id} to {entity_type} {entity_id}")
+	except Exception as e:
+		logging.error(f"Error assigning account to {entity_type} {entity_id}: {e}")
+		conn.rollback()
+	finally:
+		conn.close()
+
+
+def get_entity_assigned_account_id(entity_id: int, entity_type: str) -> int | None:
+	if entity_type not in ["group", "channel"]:
+		logging.error(f"Unknown entity type for getting assignment: {entity_type}")
+		return None
+	table_name = "groups" if entity_type == "group" else "channels"
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute(f"SELECT assigned_account_id FROM {table_name} WHERE id = ?", (entity_id,))
+	row = c.fetchone()
+	conn.close()
+	return row['assigned_account_id'] if row and row['assigned_account_id'] is not None else None
+
+
+def add_proxies_bulk(proxies: list[dict]) -> tuple[int, int]:
+	conn = get_db_connection()
+	c = conn.cursor()
+	added_count = 0
+	skipped_count = 0
+	for proxy in proxies:
+		try:
+			c.execute("""
+				INSERT INTO proxies (proxy_type, proxy_ip, proxy_port, proxy_username, proxy_password)
+				VALUES (?, ?, ?, ?, ?)
+			""", (
+				proxy.get('proxy_type', 'socks5'),
+				proxy['proxy_ip'],
+				proxy['proxy_port'],
+				proxy.get('proxy_username'),
+				proxy.get('proxy_password')
+			))
+			added_count += 1
+		except sqlite3.IntegrityError:
+			skipped_count += 1
+		except Exception as e:
+			logging.error(f"Error inserting proxy {proxy.get('proxy_ip')}: {e}")
+			skipped_count += 1
+	conn.commit()
+	conn.close()
+	return added_count, skipped_count
+
+
+def get_unassigned_proxy() -> dict | None:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("SELECT * FROM proxies WHERE assigned_account_id IS NULL ORDER BY RANDOM() LIMIT 1")
+	row = c.fetchone()
+	conn.close()
+	return dict(row) if row else None
+
+
+def assign_proxy_to_account(proxy_id: int, account_id: int):
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("UPDATE proxies SET assigned_account_id = ? WHERE id = ?", (account_id, proxy_id))
+		conn.commit()
+		logging.info(f"Proxy {proxy_id} assigned to account {account_id}")
+	except Exception as e:
+		logging.error(f"Error assigning proxy {proxy_id} to account {account_id}: {e}")
+		conn.rollback()
+	finally:
+		conn.close()

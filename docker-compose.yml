@@ -1,0 +1,17 @@
+services:
+  telegram_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: my_telegram_bot_app
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./sessions:/app/sessions
+      - ./temp_profile_photos:/app/temp_profile_photos
+      - ./g4f_har_and_cookies:/app/har_and_cookies
+      - ./g4f_generated_media:/app/generated_media
+      - ./chat_categories:/app/chat_categories
+      - ./sessions_import:/app/sessions_import

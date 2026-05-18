@@ -1,0 +1,13 @@
+.env
+.idea/
+.venv/
+data/
+sessions/
+sessions_import/
+temp_profile_photos/
+g4f_har_and_cookies/
+g4f_generated_media/
+__pycache__/
+*.py[cod]
+*.session
+*.session-journal
