@@ -41,7 +41,7 @@ from userbot import (ALL_CLIENT_USER_IDS, conversation_tracker,
                      get_active_clients, reinitialize_telethon_client)
 
 from ..bot_instance import TEMP_PHOTO_DIR, bot, dp, global_reg_cache
-from ..keyboards import main_menu_keyboard
+from ..keyboards import cancel_action_keyboard, main_menu_keyboard
 from ..states import (AccountAdditionStates, AccountManagementStates,
                       AccountSettingsStates)
 from ..utils import show_accounts_list, user_is_allowed
@@ -98,7 +98,8 @@ async def cb_bulk_add_proxies_start(callback: CallbackQuery, state: FSMContext):
         return
     await callback.message.edit_text(
         "Отправьте .txt файл с прокси.\n"
-        "Формат: `IP:PORT:USERNAME:PASSWORD` (каждый прокси на новой строке)."
+        "Формат: `IP:PORT:USERNAME:PASSWORD` (каждый прокси на новой строке).",
+        reply_markup=cancel_action_keyboard()
     )
     await state.set_state(AccountAdditionStates.WaitingForProxyFile)
     await callback.answer()
@@ -148,7 +149,7 @@ async def handle_proxy_file(message: Message, state: FSMContext):
         await state.clear()
 
 
-@dp.message(AccountAdditionStates.WaitingForProxyFile, F.text)
+@dp.message(AccountAdditionStates.WaitingForProxyFile, F.text, ~F.text.startswith('/'))
 async def handle_proxy_file_incorrectly(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): return
     await message.answer("Пожалуйста, отправьте документ (.txt файл), а не текст.")
@@ -1079,7 +1080,7 @@ async def process_profile_photo(message: Message, state: FSMContext):
         await state.clear()
 
 
-@dp.message(AccountManagementStates.WaitingForProfilePhoto)
+@dp.message(AccountManagementStates.WaitingForProfilePhoto, ~F.text.startswith('/'))
 async def process_profile_photo_invalid(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): return
     data = await state.get_data()
@@ -1220,7 +1221,7 @@ async def cb_edit_proxy_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.message(AccountManagementStates.WaitingForProxyTypeUpdate, F.text)
+@dp.message(AccountManagementStates.WaitingForProxyTypeUpdate, F.text, ~F.text.startswith('/'))
 async def process_proxy_type_update(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): return
     proxy_type_input = message.text.strip().lower()
@@ -1256,7 +1257,7 @@ async def process_proxy_port_update(message: Message, state: FSMContext):
     await state.set_state(AccountManagementStates.WaitingForProxyUsernameUpdate)
 
 
-@dp.message(AccountManagementStates.WaitingForProxyUsernameUpdate, F.text)
+@dp.message(AccountManagementStates.WaitingForProxyUsernameUpdate, F.text, ~F.text.startswith('/'))
 async def process_proxy_username_update(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): return
     username_input = message.text.strip()
@@ -1268,7 +1269,7 @@ async def process_proxy_username_update(message: Message, state: FSMContext):
     await state.set_state(AccountManagementStates.WaitingForProxyPasswordUpdate)
 
 
-@dp.message(AccountManagementStates.WaitingForProxyPasswordUpdate, F.text)
+@dp.message(AccountManagementStates.WaitingForProxyPasswordUpdate, F.text, ~F.text.startswith('/'))
 async def process_proxy_password_update(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): return
     password_input = message.text.strip()

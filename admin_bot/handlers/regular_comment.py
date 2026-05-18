@@ -8,7 +8,7 @@ from aiogram.fsm.context import FSMContext
 
 from ..bot_instance import bot
 from ..utils import user_is_allowed
-from ..keyboards import main_menu_keyboard
+from ..keyboards import cancel_action_keyboard, main_menu_keyboard
 from db import get_config_value, set_config_value
 
 
@@ -78,7 +78,7 @@ async def cb_set_regular_comment_interval(callback: CallbackQuery, state: FSMCon
     await callback.answer()
 
 
-@router.message(StateFilter("waiting_regular_comment_interval"))
+@router.message(StateFilter("waiting_regular_comment_interval"), F.text, ~F.text.startswith('/'))
 async def handle_interval_input(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id):
         await message.answer("Нет прав.")

@@ -7,6 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from ..bot_instance import dp, bot
+from ..keyboards import cancel_action_keyboard
 from ..reporting_utils import clear_auto_comment_report_file, get_auto_comment_report_file_path
 from ..utils import user_is_allowed
 from db import get_config_value, set_config_value
@@ -126,13 +127,14 @@ async def cb_set_reporting_target_id(callback: CallbackQuery, state: FSMContext)
         f"Текущий ID для отчетов: <code>{display_target_id}</code>\n"
         "Введите новый ID канала (например, -100XXXXXXXXXX) или ID пользователя (например, XXXXXXXXXX).\n"
         "Убедитесь, что у бота есть права на отправку сообщений в указанный чат/канал, или что пользователь начал диалог с ботом.",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        reply_markup=cancel_action_keyboard()
     )
     await state.set_state(ReportingStates.WaitingForTargetID)
     await callback.answer()
 
 
-@dp.message(ReportingStates.WaitingForTargetID)
+@dp.message(ReportingStates.WaitingForTargetID, F.text, ~F.text.startswith('/'))
 async def process_reporting_target_id(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id):
         await message.answer("Нет прав.")

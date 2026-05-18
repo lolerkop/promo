@@ -7,6 +7,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 
 from ..bot_instance import dp, bot, TEMP_PHOTO_DIR
+from ..keyboards import cancel_action_keyboard
 from ..states import MassProfileUpdateStates
 from ..utils import user_is_allowed, execute_mass_profile_update
 
@@ -24,12 +25,12 @@ async def cb_mass_profile_update(callback: CallbackQuery, state: FSMContext):
             await callback.answer()
             return
 
-    await callback.message.edit_text("Введите новый <b>First Name</b> для всех аккаунтов:")  # type: ignore
+    await callback.message.edit_text("Введите новый <b>First Name</b> для всех аккаунтов:", reply_markup=cancel_action_keyboard())  # type: ignore
     await state.set_state(MassProfileUpdateStates.WaitingForFirstName)
     await callback.answer()
 
 
-@dp.message(MassProfileUpdateStates.WaitingForFirstName, F.text)
+@dp.message(MassProfileUpdateStates.WaitingForFirstName, F.text, ~F.text.startswith('/'))
 async def process_mass_first_name(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): return  # type: ignore
     await state.update_data(first_name=message.text.strip())  # type: ignore
@@ -37,7 +38,7 @@ async def process_mass_first_name(message: Message, state: FSMContext):
     await state.set_state(MassProfileUpdateStates.WaitingForLastName)
 
 
-@dp.message(MassProfileUpdateStates.WaitingForLastName, F.text)
+@dp.message(MassProfileUpdateStates.WaitingForLastName, F.text, ~F.text.startswith('/'))
 async def process_mass_last_name(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): return  # type: ignore
     if message.text.strip().lower() == "пропустить":  # type: ignore
@@ -49,7 +50,7 @@ async def process_mass_last_name(message: Message, state: FSMContext):
     await state.set_state(MassProfileUpdateStates.WaitingForBio)
 
 
-@dp.message(MassProfileUpdateStates.WaitingForBio, F.text)
+@dp.message(MassProfileUpdateStates.WaitingForBio, F.text, ~F.text.startswith('/'))
 async def process_mass_bio(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): return  # type: ignore
     bio_text = message.text.strip()  # type: ignore
@@ -102,7 +103,7 @@ async def process_mass_photo(message: Message, state: FSMContext):
     await state.set_state(MassProfileUpdateStates.WaitingForUsernameChoice)
 
 
-@dp.message(MassProfileUpdateStates.WaitingForPhoto)
+@dp.message(MassProfileUpdateStates.WaitingForPhoto, ~F.text.startswith('/'))
 async def process_mass_photo_invalid(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): return  # type: ignore
     await message.answer("Пожалуйста, отправьте фото или напишите '<code>пропустить</code>'.")

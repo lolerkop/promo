@@ -19,7 +19,7 @@ from ..utils import (
     auto_handle_linked_chat_and_add_to_groups,
     remove_group_from_db_and_leave
 )
-from ..keyboards import build_channels_keyboard, main_menu_keyboard
+from ..keyboards import build_channels_keyboard, cancel_action_keyboard, main_menu_keyboard
 from ..states import ChannelManagementStates
 from db import get_db_connection
 
@@ -63,7 +63,8 @@ async def cb_single_channel_add_start(callback: CallbackQuery, state: FSMContext
         await callback.answer("У вас нет прав.")
         return
     await callback.message.edit_text(
-        "Введите username канала (например, @channelname) или инвайт-ссылку (t.me/+xxxx):")
+        "Введите username канала (например, @channelname) или инвайт-ссылку (t.me/+xxxx):",
+        reply_markup=cancel_action_keyboard())
     await state.set_state(ChannelManagementStates.WaitingForChannelIdentifier)
     await callback.answer()
 
@@ -79,7 +80,7 @@ def _is_private_invite_link(identifier: str) -> bool:
     )
 
 
-@dp.message(ChannelManagementStates.WaitingForChannelIdentifier)
+@dp.message(ChannelManagementStates.WaitingForChannelIdentifier, F.text, ~F.text.startswith('/'))
 async def handle_channel_identifier(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id):
         await message.answer("Access denied.")
@@ -170,7 +171,7 @@ async def handle_channel_identifier(message: Message, state: FSMContext):
     await message.answer(final_report, reply_markup=main_menu_keyboard())
 
 
-@dp.message(ChannelManagementStates.WaitingForLinkedChatManual)
+@dp.message(ChannelManagementStates.WaitingForLinkedChatManual, F.text, ~F.text.startswith('/'))
 async def handle_linked_chat_input_manual(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id):
         await message.answer("У вас нет прав.")
@@ -228,7 +229,8 @@ async def cb_bulk_channel_add_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("У вас нет прав.")
         return
     await callback.message.edit_text(
-        "Загрузите файл .txt, в котором каждая строка содержит ссылку или username канала."
+        "Загрузите файл .txt, в котором каждая строка содержит ссылку или username канала.",
+        reply_markup=cancel_action_keyboard()
     )
     await state.set_state(ChannelManagementStates.WaitingForBulkChannelFile)
     await callback.answer()
@@ -240,7 +242,7 @@ async def handle_bulk_channel_file(message: Message, state: FSMContext):
         await message.answer("У вас нет прав.")
         return
     if not message.document.file_name.endswith(".txt"):
-        await message.answer("Пожалуйста, загрузите файл в формате .txt")
+        await message.answer("Пожалуйста, загрузите файл в формате .txt", reply_markup=cancel_action_keyboard())
         return
 
     file_path = f"bulk_channels_{message.from_user.id}.txt"
@@ -259,7 +261,7 @@ async def handle_bulk_channel_file(message: Message, state: FSMContext):
             os.remove(file_path)
 
     if not lines:
-        await message.answer("Файл пуст или не содержит ссылок. Попробуйте снова.")
+        await message.answer("Файл пуст или не содержит ссылок. Попробуйте снова.", reply_markup=cancel_action_keyboard())
         return
 
     await message.answer("Файл получен, начинаю фоновую обработку добавления каналов...",
@@ -270,10 +272,10 @@ async def handle_bulk_channel_file(message: Message, state: FSMContext):
     await state.clear()
 
 
-@dp.message(ChannelManagementStates.WaitingForBulkChannelFile)
+@dp.message(ChannelManagementStates.WaitingForBulkChannelFile, ~F.text.startswith('/'))
 async def handle_bulk_channel_file_incorrect(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): return
-    await message.answer("Ожидается документ (.txt). Попробуйте снова или отмените действие.")
+    await message.answer("Ожидается документ (.txt). Попробуйте снова или отмените действие.", reply_markup=cancel_action_keyboard())
 
 
 @dp.callback_query(F.data == "channel_list")
@@ -364,12 +366,13 @@ async def cb_channel_remove_info(callback: CallbackQuery, state: FSMContext):
         await callback.answer("У вас нет прав.")
         return
     await callback.message.edit_text(
-        "Введите ID канала (число) или username/ссылку канала для удаления.")
+        "Введите ID канала (число) или username/ссылку канала для удаления.",
+        reply_markup=cancel_action_keyboard())
     await state.set_state(ChannelManagementStates.WaitingForChannelIdToRemove)
     await callback.answer()
 
 
-@dp.message(ChannelManagementStates.WaitingForChannelIdToRemove)
+@dp.message(ChannelManagementStates.WaitingForChannelIdToRemove, F.text, ~F.text.startswith('/'))
 async def handle_channel_remove_id(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id):
         await message.answer("У вас нет прав.")

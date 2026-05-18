@@ -25,6 +25,28 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer("Привет! Это главное меню:", reply_markup=main_menu_keyboard())
 
 
+@dp.message(Command("cancel"), StateFilter("*"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    if not user_is_allowed(message.from_user.id):
+        await message.answer("\u0423 \u0432\u0430\u0441 \u043d\u0435\u0442 \u043f\u0440\u0430\u0432.")
+        return
+    await state.clear()
+    await message.answer("\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u0435 \u043e\u0442\u043c\u0435\u043d\u0435\u043d\u043e. \u0413\u043b\u0430\u0432\u043d\u043e\u0435 \u043c\u0435\u043d\u044e:", reply_markup=main_menu_keyboard())
+
+
+@dp.callback_query(F.data == "cancel_action", StateFilter("*"))
+async def cb_cancel_action(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("\u041d\u0435\u0442 \u043f\u0440\u0430\u0432.")
+        return
+    await state.clear()
+    try:
+        await callback.message.edit_text("\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u0435 \u043e\u0442\u043c\u0435\u043d\u0435\u043d\u043e. \u0413\u043b\u0430\u0432\u043d\u043e\u0435 \u043c\u0435\u043d\u044e:", reply_markup=main_menu_keyboard())
+    except Exception:
+        await callback.message.answer("\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u0435 \u043e\u0442\u043c\u0435\u043d\u0435\u043d\u043e. \u0413\u043b\u0430\u0432\u043d\u043e\u0435 \u043c\u0435\u043d\u044e:", reply_markup=main_menu_keyboard())
+    await callback.answer("\u041e\u0442\u043c\u0435\u043d\u0435\u043d\u043e.")
+
+
 @dp.callback_query(F.data == "back_to_main_menu")
 async def cb_back_to_main_menu(callback: CallbackQuery, state: FSMContext):
     if not user_is_allowed(callback.from_user.id):

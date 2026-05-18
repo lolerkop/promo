@@ -15,7 +15,7 @@ from ..utils import (
     mass_leave_entities_for_all_clients,
     send_ai_welcome_message_to_chat
 )
-from ..keyboards import build_groups_keyboard, main_menu_keyboard
+from ..keyboards import build_groups_keyboard, cancel_action_keyboard, main_menu_keyboard
 from ..states import GroupManagementStates
 from db import get_db_connection
 
@@ -59,12 +59,13 @@ async def cb_single_group_add_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("У вас нет прав.")
         return
     await callback.message.edit_text(
-        "Введите username группы (например, @groupname) или инвайт-ссылку (t.me/joinchat/xxxx):")
+        "Введите username группы (например, @groupname) или инвайт-ссылку (t.me/joinchat/xxxx):",
+        reply_markup=cancel_action_keyboard())
     await state.set_state(GroupManagementStates.WaitingForAddGroup)
     await callback.answer()
 
 
-@dp.message(GroupManagementStates.WaitingForAddGroup)
+@dp.message(GroupManagementStates.WaitingForAddGroup, F.text, ~F.text.startswith('/'))
 async def handle_add_group(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id):
         await message.answer("У вас нет прав.")
@@ -126,7 +127,8 @@ async def cb_bulk_group_add_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("У вас нет прав.")
         return
     await callback.message.edit_text(
-        "Загрузите файл .txt, в котором каждая строка содержит ссылку или username группы."
+        "Загрузите файл .txt, в котором каждая строка содержит ссылку или username группы.",
+        reply_markup=cancel_action_keyboard()
     )
     await state.set_state(GroupManagementStates.WaitingForBulkGroupFile)
     await callback.answer()
@@ -138,7 +140,7 @@ async def handle_bulk_group_file(message: Message, state: FSMContext):
         await message.answer("У вас нет прав.")
         return
     if not message.document.file_name.endswith(".txt"):
-        await message.answer("Пожалуйста, загрузите файл в формате .txt")
+        await message.answer("Пожалуйста, загрузите файл в формате .txt", reply_markup=cancel_action_keyboard())
         return
 
     file_path = f"bulk_groups_{message.from_user.id}.txt"
@@ -157,7 +159,7 @@ async def handle_bulk_group_file(message: Message, state: FSMContext):
             os.remove(file_path)
 
     if not lines:
-        await message.answer("Файл пуст или не содержит ссылок. Попробуйте снова.")
+        await message.answer("Файл пуст или не содержит ссылок. Попробуйте снова.", reply_markup=cancel_action_keyboard())
         return
 
     await message.answer("Файл получен, начинаю фоновую обработку добавления групп...",
@@ -168,10 +170,10 @@ async def handle_bulk_group_file(message: Message, state: FSMContext):
     await state.clear()
 
 
-@dp.message(GroupManagementStates.WaitingForBulkGroupFile)
+@dp.message(GroupManagementStates.WaitingForBulkGroupFile, ~F.text.startswith('/'))
 async def handle_bulk_group_file_incorrect(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): return
-    await message.answer("Ожидается документ (.txt). Попробуйте снова или отмените действие.")
+    await message.answer("Ожидается документ (.txt). Попробуйте снова или отмените действие.", reply_markup=cancel_action_keyboard())
 
 
 @dp.callback_query(F.data == "list_groups")
@@ -262,12 +264,13 @@ async def cb_remove_single_group_start(callback: CallbackQuery, state: FSMContex
         await callback.answer("У вас нет прав.")
         return
     await callback.message.edit_text(
-        "Введите ID группы (число) или username/ссылку группы для удаления (включая отписку аккаунтов).")
+        "Введите ID группы (число) или username/ссылку группы для удаления (включая отписку аккаунтов).",
+        reply_markup=cancel_action_keyboard())
     await state.set_state(GroupManagementStates.WaitingForRemoveSingleGroup)
     await callback.answer()
 
 
-@dp.message(GroupManagementStates.WaitingForRemoveSingleGroup)
+@dp.message(GroupManagementStates.WaitingForRemoveSingleGroup, F.text, ~F.text.startswith('/'))
 async def handle_remove_single_group_id(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id):
         await message.answer("У вас нет прав.")

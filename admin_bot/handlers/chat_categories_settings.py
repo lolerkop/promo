@@ -233,7 +233,7 @@ async def cb_set_cat_rc_interval(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.message(CategoryRegularCommentStates.WaitingForInterval, F.text)
+@dp.message(CategoryRegularCommentStates.WaitingForInterval, F.text, ~F.text.startswith('/'))
 async def process_cat_rc_interval(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): await message.answer("Нет прав."); return
     data = await state.get_data()
@@ -273,7 +273,7 @@ async def cb_set_cat_rc_prompt(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.message(CategoryRegularCommentStates.WaitingForPrompt, F.text)
+@dp.message(CategoryRegularCommentStates.WaitingForPrompt, F.text, ~F.text.startswith('/'))
 async def process_cat_rc_prompt(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): await message.answer("Нет прав."); return
     data = await state.get_data()
@@ -312,7 +312,7 @@ async def cb_set_category_prompt(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.message(CategorySettingsStates.WaitingForCategoryPrompt, F.text)
+@dp.message(CategorySettingsStates.WaitingForCategoryPrompt, F.text, ~F.text.startswith('/'))
 async def process_category_prompt(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): await message.answer("Нет прав."); return
     data = await state.get_data()
@@ -347,7 +347,7 @@ async def cb_set_cat_join_count(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.message(CategorySettingsStates.WaitingForChatsToJoinCount, F.text)
+@dp.message(CategorySettingsStates.WaitingForChatsToJoinCount, F.text, ~F.text.startswith('/'))
 async def process_cat_join_count(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): await message.answer("Нет прав."); return
     data = await state.get_data()
@@ -384,7 +384,7 @@ async def cb_set_cat_join_intensity(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.message(CategorySettingsStates.WaitingForJoinIntensity, F.text)
+@dp.message(CategorySettingsStates.WaitingForJoinIntensity, F.text, ~F.text.startswith('/'))
 async def process_cat_join_intensity(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): await message.answer("Нет прав."); return
     data = await state.get_data()
@@ -666,7 +666,7 @@ async def cb_add_cat_keyword_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.message(CategorySettingsStates.WaitingForCategoryKeyword, F.text)
+@dp.message(CategorySettingsStates.WaitingForCategoryKeyword, F.text, ~F.text.startswith('/'))
 async def process_category_keyword_input(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): await message.answer("Нет прав."); return
     keyword = message.text.strip().lower()
@@ -701,7 +701,7 @@ async def cb_cat_kw_choice_predefined(callback: CallbackQuery, state: FSMContext
     await callback.answer()
 
 
-@dp.message(CategorySettingsStates.WaitingForCategoryKeywordPredefinedAnswer, F.text)
+@dp.message(CategorySettingsStates.WaitingForCategoryKeywordPredefinedAnswer, F.text, ~F.text.startswith('/'))
 async def process_cat_kw_predefined_answer(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): await message.answer("Нет прав."); return
     data = await state.get_data()

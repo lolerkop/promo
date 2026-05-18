@@ -42,6 +42,12 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def cancel_action_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\u274C \u041E\u0442\u043C\u0435\u043D\u0430", callback_data="cancel_action")]
+    ])
+
+
 def build_groups_keyboard(page: int = 1, per_page: int = 9) -> InlineKeyboardMarkup:
     conn = get_db_connection()
     cursor = conn.cursor()
