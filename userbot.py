@@ -262,8 +262,6 @@ def generate_vpn_comment(context: str = None, current_account_id_for_log: int = 
 		openai_model_db = get_config_value("openai_model", "gpt-3.5-turbo")
 		g4f_model_db = get_config_value("g4f_model", "gpt-4o-mini")
 		ai_provider_db = get_config_value("ai_provider", "openai_g4f")
-		lm_studio_base_url_db = get_config_value("lm_studio_base_url", "http://localhost:1234/v1")
-		lm_studio_model_db = get_config_value("lm_studio_model", "local-model")
 		try:
 				temperature_db = float(get_config_value("ai_temperature", "0.7"))
 		except ValueError:
@@ -297,8 +295,6 @@ def generate_vpn_comment(context: str = None, current_account_id_for_log: int = 
 				openai_model=openai_model_db,
 				g4f_model=g4f_model_db,
 				provider=ai_provider_db,
-				lm_studio_base_url=lm_studio_base_url_db,
-				lm_studio_model=lm_studio_model_db,
 				temperature=temperature_db,
 				max_tokens=max_tokens_db
 		)

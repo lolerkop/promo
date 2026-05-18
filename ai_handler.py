@@ -14,30 +14,6 @@ g4f_client = G4FClient()
 TEMPLATE_PATTERN = re.compile(r'(\d+\[[^\]\n]+\])')
 
 
-def _generate_with_lm_studio(messages, base_url, model, temperature, max_tokens):
-		data = {
-				"content": "LM Studio generation failed.",
-				"service_used": "lm_studio",
-				"success": False,
-		}
-		try:
-				client = OpenAI(base_url=base_url.rstrip("/") + "/", api_key="lm-studio")
-				resp = client.chat.completions.create(
-						model=model,
-						messages=messages,
-						temperature=temperature,
-						max_tokens=max_tokens,
-				)
-				if resp.choices and resp.choices[0].message and resp.choices[0].message.content:
-						data.update({"content": resp.choices[0].message.content, "success": True})
-				else:
-						logging.error("LM Studio returned an empty response.")
-		except Exception as e:
-				logging.error("LM Studio failure: %s - %s", type(e).__name__, e)
-				data["content"] = "LM Studio generation failed."
-		return data
-
-
 def _generate_with_g4f(messages, g4f_model, temperature, max_tokens):
 		data = {
 				"content": "Извините, G4F не смог сформировать корректный ответ.",
@@ -68,8 +44,6 @@ def generate_ai_response(
 				openai_model="gpt-3.5-turbo",
 				g4f_model="gpt-4o-mini",
 				provider="openai_g4f",
-				lm_studio_base_url="http://localhost:1234/v1",
-				lm_studio_model="local-model",
 				temperature=0.7,
 				max_tokens=150,
 ):
@@ -80,14 +54,8 @@ def generate_ai_response(
 				"success": False,
 		}
 
-		if provider == "lm_studio":
-				return _generate_with_lm_studio(
-						messages=messages,
-						base_url=lm_studio_base_url,
-						model=lm_studio_model,
-						temperature=temperature,
-						max_tokens=max_tokens,
-				)
+		if provider != "openai_g4f":
+				logging.warning("Unsupported AI provider '%s'. Falling back to OpenAI/G4F.", provider)
 
 		keys = get_active_openai_api_keys_for_cycle()
 		if not keys:

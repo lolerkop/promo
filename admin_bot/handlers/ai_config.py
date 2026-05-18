@@ -15,8 +15,6 @@ from db import (add_openai_api_key, delete_openai_api_key, get_config_value,
 
 from ..bot_instance import (DEFAULT_AI_BASE_PROMPT, DEFAULT_AI_MAX_TOKENS,
                             DEFAULT_AI_TEMPERATURE, DEFAULT_G4F_MODEL,
-                            DEFAULT_LM_STUDIO_BASE_URL,
-                            DEFAULT_LM_STUDIO_MODEL,
                             DEFAULT_OPENAI_MODEL, bot, dp)
 from ..keyboards import main_menu_keyboard
 from ..states import AIConfigStates
@@ -27,9 +25,6 @@ def ai_config_menu_keyboard() -> InlineKeyboardMarkup:
 	base_prompt = get_config_value("ai_base_prompt", DEFAULT_AI_BASE_PROMPT)
 	openai_model = get_config_value("openai_model", DEFAULT_OPENAI_MODEL)
 	g4f_model = get_config_value("g4f_model", DEFAULT_G4F_MODEL)
-	ai_provider = get_config_value("ai_provider", "openai_g4f")
-	lm_studio_base_url = get_config_value("lm_studio_base_url", DEFAULT_LM_STUDIO_BASE_URL)
-	lm_studio_model = get_config_value("lm_studio_model", DEFAULT_LM_STUDIO_MODEL)
 	temp = get_config_value("ai_temperature", DEFAULT_AI_TEMPERATURE)
 	max_tokens = get_config_value("ai_max_tokens", DEFAULT_AI_MAX_TOKENS)
 
@@ -44,22 +39,14 @@ def ai_config_menu_keyboard() -> InlineKeyboardMarkup:
 	use_ai = get_config_value("use_ai", "True").lower() == 'true'
 
 	use_ai_text = "🟢 С ИИ" if use_ai else "🔴 Без ИИ"
-	provider_text = "Provider: LM Studio" if ai_provider == "lm_studio" else "Provider: OpenAI/G4F"
 	welcome_status_text = "🟢 Включены" if welcome_enabled else "🔴 Выключены"
 
 	buttons = [
 		[InlineKeyboardButton(text="🔑 Управление API ключами OpenAI", callback_data="manage_openai_keys_menu")],
 		[InlineKeyboardButton(text=use_ai_text, callback_data="change_ai_mode")],
-		[InlineKeyboardButton(text=provider_text, callback_data="toggle_ai_provider")],
 		[
 			InlineKeyboardButton(text=f"OpenAI модель: {openai_model}", callback_data="set_openai_model"),
 			InlineKeyboardButton(text=f"G4F модель: {g4f_model}", callback_data="set_g4f_model")
-		],
-		[
-			InlineKeyboardButton(text=f"LM URL: {lm_studio_base_url}", callback_data="set_lm_studio_base_url")
-		],
-		[
-			InlineKeyboardButton(text=f"LM model: {lm_studio_model}", callback_data="set_lm_studio_model")
 		],
 		[
 			InlineKeyboardButton(text=f"Температура: {temp}", callback_data="set_ai_temp")
@@ -175,20 +162,6 @@ async def change_ai_mode(callback: CallbackQuery):
 	current_value: bool = get_config_value("use_ai", "True").lower() == 'true'
 	set_config_value("use_ai", str(not current_value))
 	await message.edit_reply_markup(reply_markup=ai_config_menu_keyboard())
-
-
-@dp.callback_query(F.data == "toggle_ai_provider")
-async def toggle_ai_provider(callback: CallbackQuery):
-	if not user_is_allowed(callback.from_user.id):
-		await callback.answer("No access.")
-		return
-
-	message = cast(Message, callback.message)
-	current_value = get_config_value("ai_provider", "openai_g4f")
-	new_value = "openai_g4f" if current_value == "lm_studio" else "lm_studio"
-	set_config_value("ai_provider", new_value)
-	await message.edit_reply_markup(reply_markup=ai_config_menu_keyboard())
-	await callback.answer(f"AI provider: {new_value}")
 
 
 @dp.callback_query(F.data == "add_openai_key_start")

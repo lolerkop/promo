@@ -14,8 +14,6 @@ class AIConfigStates(StatesGroup):
 	WaitingForBasePrompt = State()
 	WaitingForOpenAIModel = State()
 	WaitingForG4FModel = State()
-	WaitingForLMStudioBaseURL = State()
-	WaitingForLMStudioModel = State()
 	WaitingForTemperature = State()
 	WaitingForMaxTokens = State()
 	WaitingForConvPrompt = State()
