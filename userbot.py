@@ -969,6 +969,8 @@ async def reinitialize_telethon_client(account_db_id: int) -> tuple[bool, str]:
 		account_data_from_db = get_account_details(account_db_id)
 		if not account_data_from_db:
 				return False, "Аккаунт не найден в БД."
+		if not int(account_data_from_db.get("is_enabled", 1) or 0):
+				return False, "Аккаунт выключен в настройках."
 
 		client_index_to_remove = -1
 		old_client_user_id = None
@@ -1056,7 +1058,7 @@ async def start_all_clients():
 		conn = get_db_connection()
 		c = conn.cursor()
 		accs_from_db = c.execute(
-				"SELECT id, session_name, phone, api_id, api_hash, label, user_id, proxy_type, proxy_ip, proxy_port, proxy_username, proxy_password FROM accounts"
+				"SELECT id, session_name, phone, api_id, api_hash, label, user_id, proxy_type, proxy_ip, proxy_port, proxy_username, proxy_password, is_enabled FROM accounts WHERE COALESCE(is_enabled, 1) = 1"
 		).fetchall()
 		conn.close()
 

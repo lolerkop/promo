@@ -32,7 +32,8 @@ def create_tables():
 		proxy_ip TEXT,
 		proxy_port INTEGER,
 		proxy_username TEXT,
-		proxy_password TEXT
+		proxy_password TEXT,
+		is_enabled INTEGER DEFAULT 1
 	)
 	""")
 	c.execute("""
@@ -192,6 +193,7 @@ def update_all_tables():
 	_add_column_if_not_exists("chat_categories", "regular_comment_enabled", "INTEGER DEFAULT 0")
 	_add_column_if_not_exists("chat_categories", "regular_comment_interval_minutes", "INTEGER DEFAULT 60")
 	_add_column_if_not_exists("chat_categories", "regular_comment_prompt", "TEXT")
+	_add_column_if_not_exists("accounts", "is_enabled", "INTEGER DEFAULT 1")
 
 
 def set_config_value(key: str, value: str):

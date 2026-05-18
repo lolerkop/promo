@@ -38,7 +38,8 @@ from db import (add_proxies_bulk, assign_proxy_to_account, get_account_details,
                 remove_telethon_account, set_config_value,
                 unassign_proxy_for_account, update_account_proxy_settings)
 from userbot import (ALL_CLIENT_USER_IDS, conversation_tracker,
-                     get_active_clients, reinitialize_telethon_client)
+                     get_active_clients, reinitialize_telethon_client,
+                     remove_client_from_runtime)
 
 from ..bot_instance import TEMP_PHOTO_DIR, bot, dp, global_reg_cache
 from ..keyboards import cancel_action_keyboard, main_menu_keyboard
@@ -893,6 +894,8 @@ async def cb_manage_single_account_menu(callback: CallbackQuery, state: FSMConte
     text = f"Управление аккаунтом: <b>{html.escape(acc_details['label'] or acc_details['session_name'])}</b> (ID: {account_id})\n"
     text += f"Телефон: {acc_details['phone'] or '-'}\n"
     text += f"User ID: {acc_details['user_id'] or '-'}\n"
+    is_enabled = acc_details.get("is_enabled", 1)
+    text += f"Статус работы: {'включен' if is_enabled else 'выключен'}\n"
 
     proxy_text = "нет"
     if acc_details['proxy_ip'] and acc_details['proxy_port']:
@@ -903,11 +906,112 @@ async def cb_manage_single_account_menu(callback: CallbackQuery, state: FSMConte
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Edit profile", callback_data=f"profile_edit_menu:{account_id}")],
+        [InlineKeyboardButton(
+            text="⏸️ Выключить из работы" if is_enabled else "▶️ Включить в работу",
+            callback_data=f"toggle_account_enabled:{account_id}"
+        )],
+        [InlineKeyboardButton(text="🗑️ Удалить аккаунт", callback_data=f"delete_account_confirm:{account_id}")],
         [InlineKeyboardButton(text="⚙️ Управление прокси", callback_data=f"proxy_manage_for_account:{account_id}")],
         [InlineKeyboardButton(text="⬅️ К списку аккаунтов", callback_data="account_list")]
     ])
     await callback.message.edit_text(text, reply_markup=kb)
+    if callback.data.startswith("manage_account:"):
+        await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("toggle_account_enabled:"))
+async def cb_toggle_account_enabled(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    try:
+        account_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Неверный ID аккаунта.", show_alert=True)
+        return
+
+    acc_details = get_account_details(account_id)
+    if not acc_details:
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+
+    current_enabled = int(acc_details.get("is_enabled", 1) or 0)
+    new_enabled = 0 if current_enabled else 1
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE accounts SET is_enabled = ? WHERE id = ?", (new_enabled, account_id))
+    conn.commit()
+    conn.close()
+
+    if new_enabled:
+        await callback.answer("Запускаю аккаунт...", show_alert=False)
+        ok, msg = await reinitialize_telethon_client(account_id)
+        if not ok:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("UPDATE accounts SET is_enabled = 0 WHERE id = ?", (account_id,))
+            conn.commit()
+            conn.close()
+            await callback.message.answer(f"Аккаунт не удалось включить: {msg}")
+        else:
+            await callback.message.answer(f"Аккаунт включен: {msg}")
+    else:
+        await remove_client_from_runtime(account_id, acc_details.get("session_name") or str(account_id))
+        await callback.answer("Аккаунт выключен.")
+
+    await cb_manage_single_account_menu(callback, state)
+
+
+@dp.callback_query(F.data.startswith("delete_account_confirm:"))
+async def cb_delete_account_confirm(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    try:
+        account_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Неверный ID аккаунта.", show_alert=True)
+        return
+
+    acc_details = get_account_details(account_id)
+    if not acc_details:
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+
+    label = acc_details.get("label") or acc_details.get("session_name") or str(account_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔴 Да, удалить аккаунт", callback_data=f"delete_account_execute:{account_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад к аккаунту", callback_data=f"manage_account:{account_id}")]
+    ])
+    await callback.message.edit_text(
+        f"Удалить аккаунт <b>{html.escape(label)}</b> (ID: {account_id})?\n"
+        "Аккаунт будет удален из runtime, базы и файла сессии.",
+        reply_markup=kb
+    )
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("delete_account_execute:"))
+async def cb_delete_account_execute(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    try:
+        account_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Неверный ID аккаунта.", show_alert=True)
+        return
+
+    result = await remove_telethon_account(account_id)
+    await state.clear()
+    await callback.message.edit_text(
+        result,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К списку аккаунтов", callback_data="account_list")]
+        ])
+    )
+    await callback.answer("Удалено.")
 
 
 @dp.callback_query(F.data.startswith("profile_edit_menu:"))

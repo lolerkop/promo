@@ -1087,7 +1087,7 @@ async def show_accounts_list(message_to_handle: Message, page: int, is_callback:
     page = max(1, min(page, total_pages))
     offset = (page - 1) * per_page
 
-    cursor.execute("SELECT id, session_name, phone, label, user_id FROM accounts ORDER BY id LIMIT ? OFFSET ?",
+    cursor.execute("SELECT id, session_name, phone, label, user_id, is_enabled FROM accounts ORDER BY id LIMIT ? OFFSET ?",
                    (per_page, offset))
     accounts_from_db = cursor.fetchall()
     conn.close()
@@ -1112,7 +1112,10 @@ async def show_accounts_list(message_to_handle: Message, page: int, is_callback:
     for acc_db_row in accounts_from_db:
         status_info = live_client_status_map.get(acc_db_row['session_name'])
         uid_display = acc_db_row['user_id'] or (status_info.get('uid') if status_info else None) or "N/A"
-        connection_icon = "🟢" if status_info and status_info['connected'] else "🔴"
+        is_enabled = acc_db_row['is_enabled'] if 'is_enabled' in acc_db_row.keys() else 1
+        connection_icon = "🟢" if is_enabled and status_info and status_info['connected'] else "🔴"
+        if not is_enabled:
+            connection_icon = "⏸️"
 
         label_display = acc_db_row['label'] or acc_db_row['session_name'] or 'Без метки'
         max_label_len = 25
