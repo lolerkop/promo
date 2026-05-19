@@ -365,6 +365,10 @@ def create_tables():
 			proxy_username TEXT,
 			proxy_password TEXT,
 			assigned_account_id INTEGER UNIQUE REFERENCES accounts(id) ON DELETE SET NULL,
+			status TEXT DEFAULT 'active',
+			expires_at TEXT,
+			last_checked_at TEXT,
+			last_error TEXT,
 			UNIQUE(proxy_ip, proxy_port)
 		)
 	""")
@@ -400,6 +404,10 @@ def update_all_tables():
 	_add_column_if_not_exists("chat_categories", "regular_comment_interval_minutes", "INTEGER DEFAULT 60")
 	_add_column_if_not_exists("chat_categories", "regular_comment_prompt", "TEXT")
 	_add_column_if_not_exists("accounts", "is_enabled", "INTEGER DEFAULT 1")
+	_add_column_if_not_exists("proxies", "status", "TEXT DEFAULT 'active'")
+	_add_column_if_not_exists("proxies", "expires_at", "TEXT")
+	_add_column_if_not_exists("proxies", "last_checked_at", "TEXT")
+	_add_column_if_not_exists("proxies", "last_error", "TEXT")
 
 
 def set_config_value(key: str, value: str):
@@ -704,6 +712,183 @@ def update_account_proxy_settings(account_id: int, proxy_details: dict) -> bool:
 		conn.close()
 
 
+def _parse_proxy_datetime(value: str | None) -> datetime | None:
+	if not value:
+		return None
+	value = str(value).strip()
+	if not value:
+		return None
+	if len(value) == 10:
+		value = f"{value} 23:59:59"
+	if value.endswith("Z"):
+		value = value[:-1] + "+00:00"
+	for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+		try:
+			return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+		except ValueError:
+			pass
+	try:
+		parsed = datetime.fromisoformat(value)
+		if parsed.tzinfo is None:
+			parsed = parsed.replace(tzinfo=timezone.utc)
+		return parsed.astimezone(timezone.utc)
+	except ValueError:
+		return None
+
+
+def _proxy_is_expired(proxy_row: dict) -> bool:
+	status = (proxy_row.get("status") or "active").lower()
+	if status == "expired":
+		return True
+	expires_at = _parse_proxy_datetime(proxy_row.get("expires_at"))
+	return bool(expires_at and expires_at <= datetime.now(timezone.utc))
+
+
+def _proxy_status_label(proxy_row: dict) -> str:
+	return "expired" if _proxy_is_expired(proxy_row) else (proxy_row.get("status") or "active")
+
+
+def _clear_account_proxy(cursor, account_id: int):
+	cursor.execute("""
+		UPDATE accounts
+		SET proxy_type = NULL,
+			proxy_ip = NULL,
+			proxy_port = NULL,
+			proxy_username = NULL,
+			proxy_password = NULL
+		WHERE id = ?
+	""", (account_id,))
+
+
+def get_proxy_summary() -> dict:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("SELECT * FROM proxies")
+	rows = [dict(row) for row in c.fetchall()]
+	conn.close()
+	total = len(rows)
+	expired = sum(1 for row in rows if _proxy_is_expired(row))
+	busy = sum(1 for row in rows if row.get("assigned_account_id") is not None and not _proxy_is_expired(row))
+	free = sum(1 for row in rows if row.get("assigned_account_id") is None and not _proxy_is_expired(row))
+	return {"total": total, "free": free, "busy": busy, "expired": expired}
+
+
+def list_proxies(page: int = 1, per_page: int = 8) -> tuple[list[dict], int, int]:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("SELECT COUNT(*) AS cnt FROM proxies")
+	total = c.fetchone()["cnt"]
+	total_pages = (total + per_page - 1) // per_page or 1
+	page = max(1, min(page, total_pages))
+	offset = (page - 1) * per_page
+	c.execute("""
+		SELECT p.*,
+			   a.label AS account_label,
+			   a.session_name AS account_session_name,
+			   a.phone AS account_phone
+		FROM proxies p
+		LEFT JOIN accounts a ON a.id = p.assigned_account_id
+		ORDER BY p.id
+		LIMIT ? OFFSET ?
+	""", (per_page, offset))
+	rows = []
+	for row in c.fetchall():
+		item = dict(row)
+		item["computed_status"] = _proxy_status_label(item)
+		rows.append(item)
+	conn.close()
+	return rows, page, total_pages
+
+
+def get_proxy_details(proxy_id: int) -> dict | None:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("""
+		SELECT p.*,
+			   a.label AS account_label,
+			   a.session_name AS account_session_name,
+			   a.phone AS account_phone
+		FROM proxies p
+		LEFT JOIN accounts a ON a.id = p.assigned_account_id
+		WHERE p.id = ?
+	""", (proxy_id,))
+	row = c.fetchone()
+	conn.close()
+	if not row:
+		return None
+	item = dict(row)
+	item["computed_status"] = _proxy_status_label(item)
+	return item
+
+
+def delete_proxy(proxy_id: int) -> bool:
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("SELECT assigned_account_id FROM proxies WHERE id = ?", (proxy_id,))
+		row = c.fetchone()
+		if not row:
+			return False
+		if row["assigned_account_id"] is not None:
+			_clear_account_proxy(c, row["assigned_account_id"])
+		c.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
+		conn.commit()
+		return True
+	except Exception as e:
+		logging.error(f"Error deleting proxy {proxy_id}: {e}")
+		conn.rollback()
+		return False
+	finally:
+		conn.close()
+
+
+def delete_expired_proxies() -> int:
+	conn = get_db_connection()
+	c = conn.cursor()
+	deleted_count = 0
+	try:
+		c.execute("SELECT * FROM proxies")
+		expired_rows = [dict(row) for row in c.fetchall() if _proxy_is_expired(dict(row))]
+		for proxy in expired_rows:
+			if proxy.get("assigned_account_id") is not None:
+				_clear_account_proxy(c, proxy["assigned_account_id"])
+			c.execute("DELETE FROM proxies WHERE id = ?", (proxy["id"],))
+			deleted_count += c.rowcount
+		conn.commit()
+		return deleted_count
+	except Exception as e:
+		logging.error(f"Error deleting expired proxies: {e}")
+		conn.rollback()
+		return 0
+	finally:
+		conn.close()
+
+
+def delete_all_proxies() -> int:
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("SELECT COUNT(*) AS cnt FROM proxies")
+		total = c.fetchone()["cnt"]
+		c.execute("""
+			UPDATE accounts
+			SET proxy_type = NULL,
+				proxy_ip = NULL,
+				proxy_port = NULL,
+				proxy_username = NULL,
+				proxy_password = NULL
+		""")
+		c.execute("DELETE FROM proxies")
+		conn.commit()
+		return total
+	except Exception as e:
+		logging.error(f"Error deleting all proxies: {e}")
+		conn.rollback()
+		return 0
+	finally:
+		conn.close()
+
+
 def set_entity_assigned_account(entity_id: int, account_id: int, entity_type: str):
 	if entity_type not in ["group", "channel"]:
 		logging.error(f"Unknown entity type for assignment: {entity_type}")
@@ -742,15 +927,23 @@ def add_proxies_bulk(proxies: list[dict]) -> tuple[int, int]:
 	skipped_count = 0
 	for proxy in proxies:
 		try:
+			expires_at = proxy.get('expires_at')
+			if expires_at and len(str(expires_at).strip()) == 10:
+				expires_at = f"{str(expires_at).strip()} 23:59:59"
+			status = proxy.get('status') or 'active'
+			if _parse_proxy_datetime(expires_at) and _parse_proxy_datetime(expires_at) <= datetime.now(timezone.utc):
+				status = 'expired'
 			c.execute("""
-				INSERT INTO proxies (proxy_type, proxy_ip, proxy_port, proxy_username, proxy_password)
-				VALUES (?, ?, ?, ?, ?)
+				INSERT INTO proxies (proxy_type, proxy_ip, proxy_port, proxy_username, proxy_password, status, expires_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?)
 			""", (
 				proxy.get('proxy_type', 'socks5'),
 				proxy['proxy_ip'],
 				proxy['proxy_port'],
 				proxy.get('proxy_username'),
-				proxy.get('proxy_password')
+				proxy.get('proxy_password'),
+				status,
+				expires_at
 			))
 			added_count += 1
 		except sqlite3.IntegrityError:
@@ -766,7 +959,15 @@ def add_proxies_bulk(proxies: list[dict]) -> tuple[int, int]:
 def get_unassigned_proxy() -> dict | None:
 	conn = get_db_connection()
 	c = conn.cursor()
-	c.execute("SELECT * FROM proxies WHERE assigned_account_id IS NULL ORDER BY RANDOM() LIMIT 1")
+	c.execute("""
+		SELECT *
+		FROM proxies
+		WHERE assigned_account_id IS NULL
+		  AND COALESCE(status, 'active') != 'expired'
+		  AND (expires_at IS NULL OR expires_at = '' OR datetime(expires_at) > datetime('now'))
+		ORDER BY RANDOM()
+		LIMIT 1
+	""")
 	row = c.fetchone()
 	conn.close()
 	return dict(row) if row else None
@@ -781,6 +982,56 @@ def assign_proxy_to_account(proxy_id: int, account_id: int):
 		logging.info(f"Proxy {proxy_id} assigned to account {account_id}")
 	except Exception as e:
 		logging.error(f"Error assigning proxy {proxy_id} to account {account_id}: {e}")
+		conn.rollback()
+	finally:
+		conn.close()
+
+
+def upsert_proxy_for_account(account_id: int, proxy_details: dict):
+	if not proxy_details.get("proxy_ip") or not proxy_details.get("proxy_port"):
+		return
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute(
+			"SELECT id FROM proxies WHERE proxy_ip = ? AND proxy_port = ?",
+			(proxy_details.get("proxy_ip"), proxy_details.get("proxy_port"))
+		)
+		row = c.fetchone()
+		if row:
+			c.execute("""
+				UPDATE proxies
+				SET proxy_type = ?,
+					proxy_username = ?,
+					proxy_password = ?,
+					status = COALESCE(status, 'active'),
+					assigned_account_id = ?
+				WHERE id = ?
+			""", (
+				proxy_details.get("proxy_type") or "socks5",
+				proxy_details.get("proxy_username"),
+				proxy_details.get("proxy_password"),
+				account_id,
+				row["id"]
+			))
+		else:
+			c.execute("""
+				INSERT INTO proxies (
+					proxy_type, proxy_ip, proxy_port, proxy_username, proxy_password,
+					assigned_account_id, status
+				)
+				VALUES (?, ?, ?, ?, ?, ?, 'active')
+			""", (
+				proxy_details.get("proxy_type") or "socks5",
+				proxy_details.get("proxy_ip"),
+				proxy_details.get("proxy_port"),
+				proxy_details.get("proxy_username"),
+				proxy_details.get("proxy_password"),
+				account_id
+			))
+		conn.commit()
+	except Exception as e:
+		logging.error(f"Error upserting proxy for account {account_id}: {e}")
 		conn.rollback()
 	finally:
 		conn.close()

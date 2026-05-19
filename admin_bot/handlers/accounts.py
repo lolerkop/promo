@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import sqlite3
 from collections import defaultdict
@@ -33,14 +34,17 @@ from telethon.tl.types import InputUserSelf
 from telethon.tl.types import (InputPrivacyKeyPhoneNumber,
                                InputPrivacyValueDisallowAll)
 
-from db import (add_proxies_bulk, assign_proxy_to_account, get_account_details,
+from db import (add_proxies_bulk, assign_proxy_to_account, delete_all_proxies,
+                delete_expired_proxies, delete_proxy, get_account_details,
                 get_active_workspace_id, get_config_value, get_db_connection, get_unassigned_proxy,
-                get_workspace_session_dir,
+                get_proxy_details, get_proxy_summary, get_workspace_session_dir,
+                list_proxies,
                 remove_telethon_account, set_config_value,
-                unassign_proxy_for_account, update_account_proxy_settings)
+                unassign_proxy_for_account, update_account_proxy_settings,
+                upsert_proxy_for_account)
 from userbot import (ALL_CLIENT_USER_IDS, conversation_tracker,
                      get_active_clients, reinitialize_telethon_client,
-                     remove_client_from_runtime)
+                     remove_client_from_runtime, restart_workspace_clients)
 
 from ..bot_instance import TEMP_PHOTO_DIR, bot, dp, global_reg_cache
 from ..keyboards import cancel_action_keyboard, main_menu_keyboard
@@ -49,6 +53,159 @@ from ..states import (AccountAdditionStates, AccountManagementStates,
 from ..utils import show_accounts_list, user_is_allowed
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_proxy_import_line(line: str) -> dict | None:
+    line = (line or "").strip()
+    if not line or line.startswith("#"):
+        return None
+
+    bracket_match = re.match(
+        r"^(?:(socks5|socks4|http):)?\[([^\]]+)\]:(\d+)(?::([^:]*):([^:]*))?(?::(.+))?$",
+        line,
+        flags=re.IGNORECASE
+    )
+    if bracket_match:
+        proxy_type, ip, port, username, password, expires_at = bracket_match.groups()
+        return {
+            "proxy_type": (proxy_type or "socks5").lower(),
+            "proxy_ip": ip,
+            "proxy_port": int(port),
+            "proxy_username": username or None,
+            "proxy_password": password or None,
+            "expires_at": expires_at.strip() if expires_at else None,
+            "status": "active",
+        }
+
+    parts = line.split(":")
+    proxy_type = "socks5"
+    if parts and parts[0].lower() in {"socks5", "socks4", "http"}:
+        proxy_type = parts.pop(0).lower()
+
+    if len(parts) not in {2, 4, 5}:
+        return None
+
+    proxy_data = {
+        "proxy_type": proxy_type,
+        "proxy_ip": parts[0],
+        "proxy_port": int(parts[1]),
+        "proxy_username": None,
+        "proxy_password": None,
+        "expires_at": None,
+        "status": "active",
+    }
+    if len(parts) >= 4:
+        proxy_data["proxy_username"] = parts[2] or None
+        proxy_data["proxy_password"] = parts[3] or None
+    if len(parts) == 5:
+        proxy_data["expires_at"] = parts[4].strip() or None
+    return proxy_data
+
+
+def _proxy_display_status(proxy: dict) -> str:
+    status = (proxy.get("computed_status") or proxy.get("status") or "active").lower()
+    if status == "expired":
+        return "истек"
+    if status == "disabled":
+        return "выключен"
+    return "активный"
+
+
+def _proxy_owner_text(proxy: dict) -> str:
+    account_id = proxy.get("assigned_account_id")
+    if not account_id:
+        return "свободен"
+    label = proxy.get("account_label") or proxy.get("account_session_name") or proxy.get("account_phone") or "аккаунт"
+    return f"{label} (ID {account_id})"
+
+
+def _proxy_management_keyboard(page: int, total_pages: int, proxies_on_page: list[dict]) -> InlineKeyboardMarkup:
+    buttons = []
+    for proxy in proxies_on_page:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"Удалить #{proxy['id']}",
+                callback_data=f"proxy_pool_delete_confirm:{proxy['id']}:{page}"
+            )
+        ])
+
+    pagination = []
+    if page > 1:
+        pagination.append(InlineKeyboardButton(text="Назад", callback_data=f"proxy_pool_page:{page - 1}"))
+    pagination.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="ignore"))
+    if page < total_pages:
+        pagination.append(InlineKeyboardButton(text="Вперед", callback_data=f"proxy_pool_page:{page + 1}"))
+    if pagination:
+        buttons.append(pagination)
+
+    buttons.append([InlineKeyboardButton(text="Добавить прокси файлом", callback_data="bulk_add_proxies_start")])
+    buttons.append([InlineKeyboardButton(text="Удалить истекшие", callback_data="proxy_pool_delete_expired_confirm")])
+    buttons.append([InlineKeyboardButton(text="Удалить все", callback_data="proxy_pool_delete_all_confirm")])
+    buttons.append([InlineKeyboardButton(text="Назад в настройки аккаунтов", callback_data="account_settings")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _build_proxy_management_text(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    summary = get_proxy_summary()
+    proxies_on_page, page, total_pages = list_proxies(page=page, per_page=5)
+    lines = [
+        "<b>Управление прокси</b>",
+        "",
+        f"Всего: <b>{summary['total']}</b>",
+        f"Свободно: <b>{summary['free']}</b>",
+        f"Занято: <b>{summary['busy']}</b>",
+        f"Истекло: <b>{summary['expired']}</b>",
+        "",
+    ]
+
+    if not proxies_on_page:
+        lines.append("В этом пространстве пока нет прокси.")
+    else:
+        for proxy in proxies_on_page:
+            username = proxy.get("proxy_username") or "-"
+            password = "********" if proxy.get("proxy_password") else "-"
+            expires_at = proxy.get("expires_at") or "не указан"
+            last_checked = proxy.get("last_checked_at") or "не проверялся"
+            last_error = proxy.get("last_error") or "-"
+            proxy_addr = f"{proxy.get('proxy_type') or 'socks5'}://{proxy.get('proxy_ip')}:{proxy.get('proxy_port')}"
+            lines.extend([
+                f"<b>#{proxy['id']}</b> <code>{html.escape(proxy_addr)}</code>",
+                f"Статус: <b>{html.escape(_proxy_display_status(proxy))}</b>",
+                f"Занят: <code>{html.escape(_proxy_owner_text(proxy))}</code>",
+                f"Логин: <code>{html.escape(str(username))}</code> | Пароль: <code>{password}</code>",
+                f"Истекает: <code>{html.escape(str(expires_at))}</code>",
+                f"Проверка: <code>{html.escape(str(last_checked))}</code>",
+                f"Ошибка: <code>{html.escape(str(last_error)[:120])}</code>",
+                "",
+            ])
+
+    return "\n".join(lines), _proxy_management_keyboard(page, total_pages, proxies_on_page)
+
+
+def _get_expired_proxy_account_ids() -> list[int]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT assigned_account_id
+        FROM proxies
+        WHERE assigned_account_id IS NOT NULL
+          AND (
+              COALESCE(status, 'active') = 'expired'
+              OR (expires_at IS NOT NULL AND expires_at != '' AND datetime(expires_at) <= datetime('now'))
+          )
+    """)
+    account_ids = [row["assigned_account_id"] for row in cursor.fetchall()]
+    conn.close()
+    return account_ids
+
+
+def _get_all_proxy_account_ids() -> list[int]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT assigned_account_id FROM proxies WHERE assigned_account_id IS NOT NULL")
+    account_ids = [row["assigned_account_id"] for row in cursor.fetchall()]
+    conn.close()
+    return account_ids
 
 
 def _get_runtime_client_for_account(account_id: int):
@@ -82,6 +239,7 @@ async def cb_account_settings(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="🗂️ Сканировать и импортировать сессии", callback_data="account_scan_and_import")],
         [InlineKeyboardButton(text="➕ Добавить по номеру телефона", callback_data="account_add")],
         [InlineKeyboardButton(text="🗂️ Массовое добавление прокси", callback_data="bulk_add_proxies_start")],
+        [InlineKeyboardButton(text="📋 Управление прокси", callback_data="proxy_management")],
         [InlineKeyboardButton(text="❌ Удалить аккаунт", callback_data="account_remove_info")],
         [InlineKeyboardButton(text="📋 Список аккаунтов", callback_data="account_list")],
         [InlineKeyboardButton(text="💬 Автоответчик ЛС", callback_data="auto_responder_menu")],
@@ -100,7 +258,12 @@ async def cb_bulk_add_proxies_start(callback: CallbackQuery, state: FSMContext):
         return
     await callback.message.edit_text(
         "Отправьте .txt файл с прокси.\n"
-        "Формат: `IP:PORT:USERNAME:PASSWORD` (каждый прокси на новой строке).",
+        "Форматы по строкам:\n"
+        "<code>IP:PORT</code>\n"
+        "<code>IP:PORT:USERNAME:PASSWORD</code>\n"
+        "<code>IP:PORT:USERNAME:PASSWORD:YYYY-MM-DD</code>\n"
+        "<code>socks5:IP:PORT:USERNAME:PASSWORD:YYYY-MM-DD</code>\n"
+        "Для IPv6 используйте квадратные скобки: <code>[IPv6]:PORT:USER:PASS</code>.",
         reply_markup=cancel_action_keyboard()
     )
     await state.set_state(AccountAdditionStates.WaitingForProxyFile)
@@ -124,17 +287,14 @@ async def handle_proxy_file(message: Message, state: FSMContext):
                 line = line.strip()
                 if not line:
                     continue
-                parts = line.split(':')
-                if len(parts) == 4:
-                    proxies_to_add.append({
-                        'proxy_ip': parts[0],
-                        'proxy_port': int(parts[1]),
-                        'proxy_username': parts[2],
-                        'proxy_password': parts[3],
-                        'proxy_type': 'socks5'
-                    })
+                try:
+                    parsed_proxy = _parse_proxy_import_line(line)
+                    if parsed_proxy:
+                        proxies_to_add.append(parsed_proxy)
+                except (TypeError, ValueError):
+                    continue
         if not proxies_to_add:
-            await message.answer("В файле не найдено прокси в корректном формате `IP:PORT:USER:PASS`.")
+            await message.answer("В файле не найдено прокси в корректном формате.")
             return
 
         added, skipped = add_proxies_bulk(proxies_to_add)
@@ -155,6 +315,162 @@ async def handle_proxy_file(message: Message, state: FSMContext):
 async def handle_proxy_file_incorrectly(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): return
     await message.answer("Пожалуйста, отправьте документ (.txt файл), а не текст.")
+
+
+@dp.callback_query(F.data == "proxy_management")
+async def cb_proxy_management(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    await state.clear()
+    text, keyboard = _build_proxy_management_text(page=1)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("proxy_pool_page:"))
+async def cb_proxy_pool_page(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    try:
+        page = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        page = 1
+    text, keyboard = _build_proxy_management_text(page=page)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("proxy_pool_delete_confirm:"))
+async def cb_proxy_pool_delete_confirm(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    try:
+        _, proxy_id_raw, page_raw = callback.data.split(":")
+        proxy_id = int(proxy_id_raw)
+        page = int(page_raw)
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный ID прокси.", show_alert=True)
+        return
+
+    proxy = get_proxy_details(proxy_id)
+    if not proxy:
+        await callback.answer("Прокси уже не найден.", show_alert=True)
+        text, keyboard = _build_proxy_management_text(page=page)
+        await callback.message.edit_text(text, reply_markup=keyboard)
+        return
+
+    proxy_addr = f"{proxy.get('proxy_type') or 'socks5'}://{proxy.get('proxy_ip')}:{proxy.get('proxy_port')}"
+    owner = _proxy_owner_text(proxy)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Да, удалить", callback_data=f"proxy_pool_delete_execute:{proxy_id}:{page}")],
+        [InlineKeyboardButton(text="Отмена", callback_data=f"proxy_pool_page:{page}")]
+    ])
+    await callback.message.edit_text(
+        f"Удалить прокси <code>{html.escape(proxy_addr)}</code>?\n"
+        f"Занят: <code>{html.escape(owner)}</code>\n\n"
+        "Если прокси привязан к аккаунту, у аккаунта будут очищены настройки прокси.",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("proxy_pool_delete_execute:"))
+async def cb_proxy_pool_delete_execute(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    try:
+        _, proxy_id_raw, page_raw = callback.data.split(":")
+        proxy_id = int(proxy_id_raw)
+        page = int(page_raw)
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный ID прокси.", show_alert=True)
+        return
+
+    proxy = get_proxy_details(proxy_id)
+    assigned_account_id = proxy.get("assigned_account_id") if proxy else None
+    deleted = delete_proxy(proxy_id)
+    if assigned_account_id:
+        await reinitialize_telethon_client(int(assigned_account_id))
+    text, keyboard = _build_proxy_management_text(page=page)
+    prefix = "✅ Прокси удален.\n\n" if deleted else "⚠️ Прокси не найден или не удален.\n\n"
+    await callback.message.edit_text(prefix + text, reply_markup=keyboard)
+    await callback.answer("Готово." if deleted else "Не найден.")
+
+
+@dp.callback_query(F.data == "proxy_pool_delete_expired_confirm")
+async def cb_proxy_pool_delete_expired_confirm(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    summary = get_proxy_summary()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Да, удалить истекшие ({summary['expired']})", callback_data="proxy_pool_delete_expired_execute")],
+        [InlineKeyboardButton(text="Отмена", callback_data="proxy_management")]
+    ])
+    await callback.message.edit_text(
+        f"Удалить все истекшие прокси в текущем пространстве?\n"
+        f"Истекших прокси: <b>{summary['expired']}</b>\n\n"
+        "У аккаунтов, которые использовали эти прокси, настройки прокси будут очищены.",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "proxy_pool_delete_expired_execute")
+async def cb_proxy_pool_delete_expired_execute(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    affected_accounts = _get_expired_proxy_account_ids()
+    deleted_count = delete_expired_proxies()
+    if affected_accounts:
+        await restart_workspace_clients()
+    text, keyboard = _build_proxy_management_text(page=1)
+    await callback.message.edit_text(
+        f"✅ Истекшие прокси удалены: <b>{deleted_count}</b>.\n\n{text}",
+        reply_markup=keyboard
+    )
+    await callback.answer("Готово.")
+
+
+@dp.callback_query(F.data == "proxy_pool_delete_all_confirm")
+async def cb_proxy_pool_delete_all_confirm(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    summary = get_proxy_summary()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Да, удалить все ({summary['total']})", callback_data="proxy_pool_delete_all_execute")],
+        [InlineKeyboardButton(text="Отмена", callback_data="proxy_management")]
+    ])
+    await callback.message.edit_text(
+        f"Удалить <b>все</b> прокси в текущем пространстве?\n"
+        f"Всего прокси: <b>{summary['total']}</b>\n\n"
+        "Это также очистит прокси у всех аккаунтов этого пространства.",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "proxy_pool_delete_all_execute")
+async def cb_proxy_pool_delete_all_execute(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    affected_accounts = _get_all_proxy_account_ids()
+    deleted_count = delete_all_proxies()
+    if affected_accounts:
+        await restart_workspace_clients()
+    text, keyboard = _build_proxy_management_text(page=1)
+    await callback.message.edit_text(
+        f"✅ Все прокси удалены: <b>{deleted_count}</b>.\n\n{text}",
+        reply_markup=keyboard
+    )
+    await callback.answer("Готово.")
 
 
 @dp.callback_query(F.data == "account_scan_and_import")
@@ -1262,6 +1578,8 @@ async def cb_execute_delete_proxy(callback: CallbackQuery, state: FSMContext):
         'proxy_username': None, 'proxy_password': None
     }
     update_success = update_account_proxy_settings(account_id, proxy_details_to_set)
+    if update_success:
+        upsert_proxy_for_account(account_id, proxy_details_to_set)
 
     if update_success:
         await callback.message.edit_text(
