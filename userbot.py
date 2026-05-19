@@ -27,11 +27,13 @@ from telethon.utils import get_peer_id
 
 from ai_handler import generate_ai_response, template_response
 from db import (add_analytics_log, get_account_details,
+                get_account_proxy_block_reason,
                 get_active_category_prompt_for_chat, get_category_keywords,
                 get_config_value, get_current_workspace_id, get_db_connection,
                 get_entity_assigned_account_id, get_workspace_session_dir,
                 list_workspaces, reset_workspace_context,
-                set_config_value, set_workspace_context, update_all_tables)
+                refresh_expired_proxies, set_config_value,
+                set_workspace_context, update_all_tables)
 
 try:
 		from admin_bot.reporting_utils import send_report
@@ -1233,6 +1235,17 @@ async def reinitialize_telethon_client(account_db_id: int) -> tuple[bool, str]:
 		if not int(account_data_from_db.get("is_enabled", 1) or 0):
 				return False, "Account is disabled in this workspace."
 
+		proxy_block_reason = get_account_proxy_block_reason(account_data_from_db)
+		if proxy_block_reason:
+				await remove_client_from_runtime(account_db_id, account_data_from_db.get("session_name", str(account_db_id)))
+				add_analytics_log(
+						account_id=account_db_id,
+						action_type="client_start_blocked_proxy",
+						details=proxy_block_reason,
+						success=False
+				)
+				return False, f"Client was not started because {proxy_block_reason}."
+
 		await remove_client_from_runtime(account_db_id, account_data_from_db.get("session_name", str(account_db_id)))
 
 		new_client = await _create_client_with_handlers(account_data_from_db, workspace_id)
@@ -1316,6 +1329,7 @@ async def start_workspace_clients(workspace_id: str):
 		try:
 				await _ensure_cleanup_post_locks_task()
 				update_all_tables()
+				refresh_expired_proxies()
 				init_listen_all()
 
 				existing_tasks = workspace_client_tasks.setdefault(workspace_id, {})
@@ -1351,6 +1365,18 @@ async def start_workspace_clients(workspace_id: str):
 
 						client_data_dict = dict(acc_row)
 						client_data_dict["_workspace_id"] = workspace_id
+						proxy_block_reason = get_account_proxy_block_reason(client_data_dict)
+						if proxy_block_reason:
+								logging.warning(
+										f"Skipping account ID={db_id} in workspace {workspace_id}: {proxy_block_reason}."
+								)
+								add_analytics_log(
+										account_id=db_id,
+										action_type="client_start_blocked_proxy",
+										details=proxy_block_reason,
+										success=False
+								)
+								continue
 						conversation_tracker[db_id] = defaultdict(int)
 
 						new_client = await _create_client_with_handlers(client_data_dict, workspace_id)

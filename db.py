@@ -768,9 +768,145 @@ def get_proxy_summary() -> dict:
 	conn.close()
 	total = len(rows)
 	expired = sum(1 for row in rows if _proxy_is_expired(row))
-	busy = sum(1 for row in rows if row.get("assigned_account_id") is not None and not _proxy_is_expired(row))
-	free = sum(1 for row in rows if row.get("assigned_account_id") is None and not _proxy_is_expired(row))
-	return {"total": total, "free": free, "busy": busy, "expired": expired}
+	failed = sum(1 for row in rows if not _proxy_is_expired(row) and (row.get("status") or "active").lower() == "failed")
+	busy = sum(
+		1 for row in rows
+		if row.get("assigned_account_id") is not None
+		and not _proxy_is_expired(row)
+		and (row.get("status") or "active").lower() == "active"
+	)
+	free = sum(
+		1 for row in rows
+		if row.get("assigned_account_id") is None
+		and not _proxy_is_expired(row)
+		and (row.get("status") or "active").lower() == "active"
+	)
+	return {"total": total, "free": free, "busy": busy, "expired": expired, "failed": failed}
+
+
+def refresh_expired_proxies() -> list[int]:
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("""
+			SELECT id, assigned_account_id, expires_at
+			FROM proxies
+			WHERE expires_at IS NOT NULL
+			  AND expires_at != ''
+			  AND COALESCE(status, 'active') != 'expired'
+		""")
+		expired_rows = []
+		for row in c.fetchall():
+			row_dict = dict(row)
+			expires_at = _parse_proxy_datetime(row_dict.get("expires_at"))
+			if expires_at and expires_at <= datetime.now(timezone.utc):
+				expired_rows.append(row_dict)
+
+		for proxy in expired_rows:
+			c.execute("""
+				UPDATE proxies
+				SET status = 'expired',
+					last_checked_at = ?,
+					last_error = ?
+				WHERE id = ?
+			""", (
+				datetime.now(timezone.utc).isoformat(timespec="seconds"),
+				"Rental expiration time has passed.",
+				proxy["id"]
+			))
+		conn.commit()
+		return [
+			row["assigned_account_id"]
+			for row in expired_rows
+			if row.get("assigned_account_id") is not None
+		]
+	except Exception as e:
+		logging.error(f"Error refreshing expired proxies: {e}")
+		conn.rollback()
+		return []
+	finally:
+		conn.close()
+
+
+def update_proxy_check_result(proxy_id: int, status: str, last_error: str = None):
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("""
+			UPDATE proxies
+			SET status = ?,
+				last_checked_at = ?,
+				last_error = ?
+			WHERE id = ?
+		""", (
+			status,
+			datetime.now(timezone.utc).isoformat(timespec="seconds"),
+			last_error,
+			proxy_id
+		))
+		conn.commit()
+	except Exception as e:
+		logging.error(f"Error updating proxy check result {proxy_id}: {e}")
+		conn.rollback()
+	finally:
+		conn.close()
+
+
+def get_all_proxies_for_check() -> list[dict]:
+	refresh_expired_proxies()
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("""
+		SELECT p.*,
+			   a.label AS account_label,
+			   a.session_name AS account_session_name,
+			   a.phone AS account_phone
+		FROM proxies p
+		LEFT JOIN accounts a ON a.id = p.assigned_account_id
+		ORDER BY p.id
+	""")
+	rows = []
+	for row in c.fetchall():
+		item = dict(row)
+		item["computed_status"] = _proxy_status_label(item)
+		rows.append(item)
+	conn.close()
+	return rows
+
+
+def get_account_proxy_block_reason(account_data: dict) -> str | None:
+	if not account_data.get("proxy_ip") or not account_data.get("proxy_port"):
+		return None
+
+	refresh_expired_proxies()
+	conn = get_db_connection()
+	c = conn.cursor()
+	row = None
+	try:
+		c.execute("SELECT * FROM proxies WHERE assigned_account_id = ? LIMIT 1", (account_data.get("id"),))
+		row = c.fetchone()
+		if not row:
+			c.execute(
+				"SELECT * FROM proxies WHERE proxy_ip = ? AND proxy_port = ? LIMIT 1",
+				(account_data.get("proxy_ip"), account_data.get("proxy_port"))
+			)
+			row = c.fetchone()
+	finally:
+		conn.close()
+
+	if not row:
+		return None
+
+	proxy = dict(row)
+	proxy_addr = f"{proxy.get('proxy_ip')}:{proxy.get('proxy_port')}"
+	if _proxy_is_expired(proxy):
+		return f"proxy {proxy_addr} is expired"
+
+	status = (proxy.get("status") or "active").lower()
+	if status in {"failed", "disabled", "expired"}:
+		return f"proxy {proxy_addr} status is {status}"
+
+	return None
 
 
 def list_proxies(page: int = 1, per_page: int = 8) -> tuple[list[dict], int, int]:
@@ -957,13 +1093,14 @@ def add_proxies_bulk(proxies: list[dict]) -> tuple[int, int]:
 
 
 def get_unassigned_proxy() -> dict | None:
+	refresh_expired_proxies()
 	conn = get_db_connection()
 	c = conn.cursor()
 	c.execute("""
 		SELECT *
 		FROM proxies
 		WHERE assigned_account_id IS NULL
-		  AND COALESCE(status, 'active') != 'expired'
+		  AND COALESCE(status, 'active') = 'active'
 		  AND (expires_at IS NULL OR expires_at = '' OR datetime(expires_at) > datetime('now'))
 		ORDER BY RANDOM()
 		LIMIT 1
@@ -1004,7 +1141,9 @@ def upsert_proxy_for_account(account_id: int, proxy_details: dict):
 				SET proxy_type = ?,
 					proxy_username = ?,
 					proxy_password = ?,
-					status = COALESCE(status, 'active'),
+					status = 'active',
+					last_checked_at = NULL,
+					last_error = NULL,
 					assigned_account_id = ?
 				WHERE id = ?
 			""", (

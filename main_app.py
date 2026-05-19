@@ -12,11 +12,11 @@ from admin_bot.main import main_bot_polling_task
 from app_core_utils import send_regular_comment_now_core
 from db import (add_analytics_log, create_tables, get_config_value,
                 get_current_workspace_id, get_db_connection, list_workspaces,
-                reset_workspace_context, set_workspace_context,
+                refresh_expired_proxies, reset_workspace_context, set_workspace_context,
                 update_all_tables)
 from shared import active_background_tasks
 from userbot import (generate_vpn_comment, get_next_account_in_cycle,
-                     start_all_clients, stop_all_clients)
+                     restart_workspace_clients, start_all_clients, stop_all_clients)
 
 try:
     from admin_bot.reporting_utils import send_report
@@ -431,6 +431,13 @@ async def regular_comment_task_for_scheduler():
         workspace_id = workspace["id"]
         token = set_workspace_context(workspace_id)
         try:
+            expired_account_ids = refresh_expired_proxies()
+            if expired_account_ids:
+                logging.warning(
+                    f"Expired proxies detected in workspace {workspace_id}; restarting clients. "
+                    f"Affected accounts: {expired_account_ids}"
+                )
+                await restart_workspace_clients(workspace_id)
             await _regular_comment_task_for_current_workspace(
                 workspace_id,
                 workspace.get("name") or workspace_id
