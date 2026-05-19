@@ -47,6 +47,13 @@ channel_join_rate_state = {}
 subscription_runtime_loads: dict[tuple[str, int], int] = {}
 
 
+def _coerce_entity_identifier(identifier):
+    text = str(identifier).strip()
+    if text.lstrip("-").isdigit():
+        return int(text)
+    return text
+
+
 def _subscription_runtime_key(account_id: int):
     return (get_current_workspace_id(), account_id)
 
@@ -314,7 +321,7 @@ async def get_entity_info_robust(identifier: str, admin_chat_id: int, entity_typ
     for client, client_data in clients_to_check:
         client_label = client_data.get('label', client.session.filename)
         try:
-            entity = await client.get_entity(identifier)
+            entity = await client.get_entity(_coerce_entity_identifier(identifier))
 
             result = {
                 "id": get_peer_id(entity),
@@ -387,7 +394,7 @@ async def join_group_with_client(client: TelegramClient, link_or_username: str, 
         else:
             logging.info(
                 f"Аккаунт {client.session.filename} пытается присоединиться к сущности: {link_or_username.strip()}")
-            entity = await client.get_entity(link_or_username.strip())
+            entity = await client.get_entity(_coerce_entity_identifier(link_or_username))
             await client(JoinChannelRequest(entity))
 
         logging.info(f"Аккаунт {client.session.filename} успешно присоединился к {link_or_username}")
@@ -980,7 +987,7 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
             async def add_channel_to_db(identifier: str, assigned_id: int | None, info_client: TelegramClient):
                 try:
                     try:
-                        entity = await info_client.get_entity(identifier)
+                        entity = await info_client.get_entity(_coerce_entity_identifier(identifier))
                         channel_info = {
                             "id": get_peer_id(entity),
                             "username": getattr(entity, "username", None),
@@ -1552,7 +1559,7 @@ async def auto_handle_linked_chat_and_add_to_groups(admin_chat_id: int, main_cha
         linked_chat_info_dict['id'])
 
     identifier_for_join_call = linked_chat_info_dict["username"] if linked_chat_info_dict["username"] else str(
-        linked_chat_id_from_api)
+        linked_chat_peer_id)
 
     await bot.send_message(admin_chat_id,
                            f"Найдена связанная группа: <b>{html.escape(linked_chat_display_name)}</b> (ID: {linked_chat_info_dict['id']}). Подписываю аккаунты используя '{identifier_for_join_call}'...")

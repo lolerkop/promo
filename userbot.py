@@ -132,6 +132,27 @@ def _linked_chat_peer_from_db(value):
 		return linked_chat_id
 
 
+def _matching_global_keyword_from_rows(rows, text: str | None) -> str | None:
+		text_lower = (text or "").lower()
+		if not text_lower:
+				return None
+		for row in rows:
+				keyword = (row["keyword"] or "").lower()
+				if keyword and keyword in text_lower:
+						return keyword
+		return None
+
+
+def _matching_global_keyword_from_db(text: str | None) -> str | None:
+		conn = get_db_connection()
+		cursor = conn.cursor()
+		try:
+				cursor.execute("SELECT keyword FROM responses")
+				return _matching_global_keyword_from_rows(cursor.fetchall(), text)
+		finally:
+				conn.close()
+
+
 def _get_group_assigned_account_id(chat_id: int) -> int | None:
 		chat_id_variants = _chat_id_variants(chat_id)
 		if not chat_id_variants:
@@ -629,11 +650,11 @@ async def on_new_message_handler(event, client_obj, client_data):
 						listen_all_enabled = get_config_value("listen_all", "True").lower() == "true"
 						should_be_active_in_chat = manually_added_group or is_in_active_category_for_account or listen_all_enabled
 						can_check_global_keywords = should_be_active_in_chat
+						cursor.execute("SELECT keyword, answer, response_type FROM responses")
+						global_responses = cursor.fetchall()
 
 						if can_check_global_keywords:
 								text_lower_global = event.raw_text.lower()
-								cursor.execute("SELECT keyword, answer, response_type FROM responses")
-								global_responses = cursor.fetchall()
 
 								for r_config in global_responses:
 										keyword_from_db = r_config["keyword"].lower()
@@ -657,6 +678,13 @@ async def on_new_message_handler(event, client_obj, client_data):
 																									 is_dialogue_reply=False)
 												processed_by_keyword = True
 												break
+						else:
+								inactive_keyword = _matching_global_keyword_from_rows(global_responses, event.raw_text)
+								if inactive_keyword:
+										logging.info(
+												"ON_NEW_MESSAGE: keyword '%s' ignored in chat %s because listen_all=False and the group/category is not enabled.",
+												inactive_keyword, chat_id
+										)
 				conn.close()
 
 		except Exception as e:
@@ -935,6 +963,12 @@ async def _create_client_with_handlers(acc_row_data: dict, workspace_id: str = N
 																					 ccd=current_client_data_dict):
 						set_workspace_context(ccd.get("_workspace_id", workspace_id))
 						if event.sender_id in ALL_CLIENT_USER_IDS:
+								ignored_keyword = _matching_global_keyword_from_db(getattr(event, "raw_text", None))
+								if ignored_keyword:
+										logging.info(
+												"ON_NEW_MESSAGE: keyword '%s' ignored in chat %s because sender %s is a managed account.",
+												ignored_keyword, getattr(event, "chat_id", "N/A"), event.sender_id
+										)
 								return
 
 						if event.is_private:
