@@ -515,6 +515,80 @@ async def anti_spam_send_reply(event, text, user_id, current_account_id_for_log:
 				)
 
 
+async def send_rotating_chat_reply(event, text: str, user_id, cycle_name: str, action_details: str,
+																	 coordinator_account_id: int | None = None,
+																	 coordinator_label: str = "N/A") -> bool:
+		candidate_clients = get_accounts_ordered_for_cycle(cycle_name)
+		if not candidate_clients:
+				logging.warning(f"ROTATING_REPLY: no connected accounts for {cycle_name}.")
+				add_analytics_log(
+						account_id=coordinator_account_id,
+						action_type=f"{action_details}_fail",
+						details=f"No connected accounts for chat {event.chat_id}",
+						success=False
+				)
+				return False
+
+		delay = random.randint(REPLY_DELAY_MIN, REPLY_DELAY_MAX)
+		first_candidate = candidate_clients[0][1]
+		logging.info(
+				f"ROTATING_REPLY: cycle={cycle_name}; coordinator={coordinator_label} (ID: {coordinator_account_id}); "
+				f"first candidate={first_candidate.get('label', 'N/A')} (ID: {first_candidate.get('id')}); delay={delay}s."
+		)
+		await asyncio.sleep(delay)
+
+		event_text_for_report = event.raw_text if hasattr(event, "raw_text") else "N/A"
+		attempt_errors = []
+
+		for reply_client, reply_data in candidate_clients:
+				reply_account_id = reply_data.get("id")
+				reply_label = reply_data.get("label", reply_data.get("session_name", "N/A"))
+				try:
+						await reply_client.send_message(
+								entity=event.chat_id,
+								message=text,
+								reply_to=event.message.id,
+								parse_mode="html",
+								link_preview=False
+						)
+						record_account_cycle_success(cycle_name, reply_account_id)
+						add_analytics_log(
+								account_id=reply_account_id,
+								action_type=action_details,
+								details=f"Chat: {event.chat_id}, ReplyTo: {event.message.id}, User: {user_id}",
+								success=True
+						)
+						logging.info(
+								f"ROTATING_REPLY: account {reply_label} (ID: {reply_account_id}) sent {action_details} "
+								f"in chat {event.chat_id} as reply to {event.message.id}."
+						)
+						return True
+				except Exception as e:
+						error_text = f"{reply_label} (ID: {reply_account_id}): {type(e).__name__}: {e}"
+						attempt_errors.append(error_text)
+						logging.warning(f"ROTATING_REPLY: send failed for {error_text}")
+						add_analytics_log(
+								account_id=reply_account_id,
+								action_type=f"{action_details}_fail",
+								details=f"Chat: {event.chat_id}, ReplyTo: {event.message.id}, Error: {type(e).__name__}: {e}",
+								success=False
+						)
+
+		await send_report(
+				report_title="Ответ на сообщение",
+				status="❌ Ошибка",
+				account_info=f"<code>{html.escape(str(coordinator_label))}</code> (ID: {coordinator_account_id if coordinator_account_id else 'N/A'})",
+				event_details=(
+						f"Кому: <code>{user_id}</code> (в чате <code>{event.chat_id}</code>)\n"
+						f"Триггер: {html.escape(action_details)}\n"
+						f"Оригинал: <pre>{html.escape(event_text_for_report[:400])}</pre>"
+				),
+				response_info=f"<pre>{html.escape((text or '')[:400])}</pre>",
+				error_info="\n".join(attempt_errors[-10:]) if attempt_errors else "No send attempts succeeded."
+		)
+		return False
+
+
 async def on_private_message_handler(event, client_obj, client_data):
 		account_db_id = client_data.get("id")
 		account_label = client_data.get("label", "N/A")
@@ -632,9 +706,15 @@ async def on_new_message_handler(event, client_obj, client_data):
 														chat_id_for_prompt=chat_id
 												)
 
-										await anti_spam_send_reply(event, ans_text_cat, sender_id, account_db_id,
-																							 action_details_str_cat, client_label=account_label,
-																							 is_dialogue_reply=False)
+										await send_rotating_chat_reply(
+												event,
+												ans_text_cat,
+												sender_id,
+												cycle_name=f"trigger_reply_chat_{chat_id}",
+												action_details=action_details_str_cat,
+												coordinator_account_id=account_db_id,
+												coordinator_label=account_label,
+										)
 										processed_by_keyword = True
 										break
 
@@ -673,9 +753,15 @@ async def on_new_message_handler(event, client_obj, client_data):
 																chat_id_for_prompt=None,
 														)
 
-												await anti_spam_send_reply(event, ans_text_to_send, sender_id, account_db_id,
-																									 action_details_str, client_label=account_label,
-																									 is_dialogue_reply=False)
+												await send_rotating_chat_reply(
+														event,
+														ans_text_to_send,
+														sender_id,
+														cycle_name=f"trigger_reply_chat_{chat_id}",
+														action_details=action_details_str,
+														coordinator_account_id=account_db_id,
+														coordinator_label=account_label,
+												)
 												processed_by_keyword = True
 												break
 						else:
