@@ -2,26 +2,25 @@ import logging
 import html
 import os
 from datetime import datetime, timezone
-from db import get_config_value  # ИСПРАВЛЕНО
+from db import get_active_workspace_id, get_config_value  # ИСПРАВЛЕНО
 from .bot_instance import bot
 
 
 REPORTS_DIR = os.path.join("data", "reports")
-AUTO_COMMENT_REPORT_FILE = os.path.join(REPORTS_DIR, "auto_comment_reports.txt")
 
 
 def _ensure_reports_dir():
-    os.makedirs(REPORTS_DIR, exist_ok=True)
+    os.makedirs(os.path.join(REPORTS_DIR, get_active_workspace_id()), exist_ok=True)
 
 
 def get_auto_comment_report_file_path() -> str:
     _ensure_reports_dir()
-    return AUTO_COMMENT_REPORT_FILE
+    return os.path.join(REPORTS_DIR, get_active_workspace_id(), "auto_comment_reports.txt")
 
 
 def clear_auto_comment_report_file():
     _ensure_reports_dir()
-    with open(AUTO_COMMENT_REPORT_FILE, "w", encoding="utf-8") as f:
+    with open(get_auto_comment_report_file_path(), "w", encoding="utf-8") as f:
         f.write("")
 
 
@@ -71,7 +70,7 @@ def append_auto_comment_report(
         f"Send mode: {sent_mode}\n\n"
     )
 
-    with open(AUTO_COMMENT_REPORT_FILE, "a", encoding="utf-8") as f:
+    with open(get_auto_comment_report_file_path(), "a", encoding="utf-8") as f:
         f.write(entry)
 
 

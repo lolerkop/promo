@@ -1,6 +1,9 @@
 import logging
+import json
 import os
+import shutil
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -8,10 +11,154 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DB_PATH = os.getenv("DB_PATH", "data/database.sqlite")
+WORKSPACES_DIR = os.getenv("WORKSPACES_DIR", "data/workspaces")
+WORKSPACES_INDEX_PATH = os.path.join(WORKSPACES_DIR, "workspaces.json")
+DEFAULT_WORKSPACE_ID = "default"
+
+
+def _default_workspace() -> dict:
+	return {
+		"id": DEFAULT_WORKSPACE_ID,
+		"name": "Основное",
+		"db_path": DB_PATH,
+		"session_dir": "sessions",
+	}
+
+
+def _save_workspace_index(index: dict):
+	os.makedirs(WORKSPACES_DIR, exist_ok=True)
+	with open(WORKSPACES_INDEX_PATH, "w", encoding="utf-8") as f:
+		json.dump(index, f, ensure_ascii=False, indent=2)
+
+
+def _load_workspace_index() -> dict:
+	default_index = {"active": DEFAULT_WORKSPACE_ID, "workspaces": [_default_workspace()]}
+	if not os.path.exists(WORKSPACES_INDEX_PATH):
+		_save_workspace_index(default_index)
+		return default_index
+	try:
+		with open(WORKSPACES_INDEX_PATH, "r", encoding="utf-8") as f:
+			index = json.load(f)
+	except Exception as e:
+		logging.error(f"Failed to read workspaces index, recreating default: {e}")
+		_save_workspace_index(default_index)
+		return default_index
+
+	workspaces = index.get("workspaces") or []
+	if not any(ws.get("id") == DEFAULT_WORKSPACE_ID for ws in workspaces):
+		workspaces.insert(0, _default_workspace())
+	index["workspaces"] = workspaces
+	if not index.get("active") or not any(ws.get("id") == index.get("active") for ws in workspaces):
+		index["active"] = DEFAULT_WORKSPACE_ID
+	return index
+
+
+def list_workspaces() -> list[dict]:
+	return list(_load_workspace_index().get("workspaces", []))
+
+
+def get_active_workspace() -> dict:
+	index = _load_workspace_index()
+	active_id = index.get("active", DEFAULT_WORKSPACE_ID)
+	for workspace in index.get("workspaces", []):
+		if workspace.get("id") == active_id:
+			return workspace
+	return _default_workspace()
+
+
+def get_active_workspace_id() -> str:
+	return get_active_workspace().get("id", DEFAULT_WORKSPACE_ID)
+
+
+def get_active_workspace_name() -> str:
+	return get_active_workspace().get("name", "Основное")
+
+
+def get_current_db_path() -> str:
+	db_path = get_active_workspace().get("db_path") or DB_PATH
+	parent = os.path.dirname(db_path)
+	if parent:
+		os.makedirs(parent, exist_ok=True)
+	return db_path
+
+
+def get_workspace_session_dir(workspace_id: str = None) -> str:
+	workspace = None
+	if workspace_id:
+		for item in list_workspaces():
+			if item.get("id") == workspace_id:
+				workspace = item
+				break
+	else:
+		workspace = get_active_workspace()
+	session_dir = (workspace or _default_workspace()).get("session_dir") or "sessions"
+	os.makedirs(session_dir, exist_ok=True)
+	return session_dir
+
+
+def create_workspace(name: str) -> dict:
+	clean_name = (name or "").strip()
+	if not clean_name:
+		raise ValueError("Workspace name is empty.")
+	workspace_id = f"ws_{uuid.uuid4().hex[:10]}"
+	workspace = {
+		"id": workspace_id,
+		"name": clean_name,
+		"db_path": os.path.join(WORKSPACES_DIR, workspace_id, "database.sqlite"),
+		"session_dir": os.path.join("sessions", "workspaces", workspace_id),
+	}
+	index = _load_workspace_index()
+	index["workspaces"].append(workspace)
+	index["active"] = workspace_id
+	_save_workspace_index(index)
+	update_all_tables()
+	return workspace
+
+
+def switch_workspace(workspace_id: str) -> dict:
+	index = _load_workspace_index()
+	for workspace in index.get("workspaces", []):
+		if workspace.get("id") == workspace_id:
+			index["active"] = workspace_id
+			_save_workspace_index(index)
+			update_all_tables()
+			return workspace
+	raise ValueError("Workspace not found.")
+
+
+def delete_workspace(workspace_id: str) -> bool:
+	if workspace_id == DEFAULT_WORKSPACE_ID:
+		raise ValueError("Default workspace cannot be deleted.")
+	index = _load_workspace_index()
+	workspace_to_delete = None
+	remaining = []
+	for workspace in index.get("workspaces", []):
+		if workspace.get("id") == workspace_id:
+			workspace_to_delete = workspace
+		else:
+			remaining.append(workspace)
+	if not workspace_to_delete:
+		raise ValueError("Workspace not found.")
+	index["workspaces"] = remaining
+	if index.get("active") == workspace_id:
+		index["active"] = DEFAULT_WORKSPACE_ID
+	_save_workspace_index(index)
+	for path in (workspace_to_delete.get("db_path"), workspace_to_delete.get("session_dir")):
+		if not path or path in (DB_PATH, "sessions"):
+			continue
+		try:
+			if os.path.isdir(path):
+				shutil.rmtree(path)
+			elif os.path.exists(path):
+				os.remove(path)
+		except Exception as e:
+			logging.warning(f"Failed to remove workspace path {path}: {e}")
+	update_all_tables()
+	return True
 
 
 def get_db_connection():
-	conn = sqlite3.connect(DB_PATH)
+	conn = sqlite3.connect(get_current_db_path())
 	conn.row_factory = sqlite3.Row
 	return conn
 
@@ -329,7 +476,7 @@ async def remove_telethon_account(acc_id: int) -> str:
 	await remove_client_from_runtime(acc_id, session_name)
 
 	try:
-		session_file_path = os.path.join("sessions", f"{session_name}.session")
+		session_file_path = os.path.join(get_workspace_session_dir(), f"{session_name}.session")
 		if os.path.exists(session_file_path):
 			os.remove(session_file_path)
 

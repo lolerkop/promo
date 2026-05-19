@@ -29,7 +29,8 @@ from ai_handler import generate_ai_response, template_response
 from db import (add_analytics_log, get_account_details,
                 get_active_category_prompt_for_chat, get_category_keywords,
                 get_config_value, get_db_connection,
-                get_entity_assigned_account_id, set_config_value)
+                get_entity_assigned_account_id, get_workspace_session_dir,
+                set_config_value)
 
 try:
 		from admin_bot.reporting_utils import send_report
@@ -803,7 +804,7 @@ async def _create_client_with_handlers(acc_row_data: dict) -> TelegramClient | N
 						proxy_details_runtime["password"] = acc_row_data["proxy_password"]
 				proxy_params_runtime = proxy_details_runtime
 
-		session = SQLiteSession(f"sessions/{sname}")
+		session = SQLiteSession(os.path.join(get_workspace_session_dir(), sname))
 		client = TelegramClient(session, api_id_val, api_hash_val, proxy=proxy_params_runtime)
 
 		try:
@@ -1046,6 +1047,33 @@ async def remove_client_from_runtime(account_db_id: int, session_name_for_log: s
 				await client_to_disconnect.disconnect()
 
 		logging.info(f"Клиент ID {account_db_id} ({session_name_for_log}) удален из runtime и отключен.")
+
+
+async def stop_all_clients():
+		global clients, ALL_CLIENT_USER_IDS, client_tasks
+		for account_id, task in list(client_tasks.items()):
+				if task and not task.done():
+						task.cancel()
+						try:
+								await task
+						except asyncio.CancelledError:
+								pass
+						except Exception as e:
+								logging.debug(f"Client task {account_id} stopped with error: {e}")
+		client_tasks.clear()
+		for client_obj, client_data in list(clients):
+				try:
+						if client_obj and client_obj.is_connected():
+								await client_obj.disconnect()
+				except Exception as e:
+						logging.warning(f"Failed to disconnect client {client_data.get('session_name')}: {e}")
+		clients = []
+		ALL_CLIENT_USER_IDS.clear()
+
+
+async def restart_all_clients():
+		await stop_all_clients()
+		return await start_all_clients()
 
 
 async def start_all_clients():

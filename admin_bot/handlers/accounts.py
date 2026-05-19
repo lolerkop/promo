@@ -35,6 +35,7 @@ from telethon.tl.types import (InputPrivacyKeyPhoneNumber,
 
 from db import (add_proxies_bulk, assign_proxy_to_account, get_account_details,
                 get_config_value, get_db_connection, get_unassigned_proxy,
+                get_workspace_session_dir,
                 remove_telethon_account, set_config_value,
                 unassign_proxy_for_account, update_account_proxy_settings)
 from userbot import (ALL_CLIENT_USER_IDS, conversation_tracker,
@@ -166,7 +167,7 @@ async def cb_scan_and_import_sessions(callback: CallbackQuery, state: FSMContext
     await callback.answer()
 
     SESSIONS_IMPORT_DIR = "sessions_import"
-    SESSIONS_DIR = "sessions"
+    SESSIONS_DIR = get_workspace_session_dir()
     SESSIONS_ARCHIVE_DIR = os.path.join(SESSIONS_IMPORT_DIR, "archive")
 
     os.makedirs(SESSIONS_ARCHIVE_DIR, exist_ok=True)
@@ -483,7 +484,7 @@ async def initiate_telegram_connection(message_object_for_reply: Message, state:
 
     client = None
     try:
-        session_path = os.path.join("sessions", f"{label}.session")
+        session_path = os.path.join(get_workspace_session_dir(), f"{label}.session")
         client = TelegramClient(SQLiteSession(session_path), api_id, api_hash, proxy=proxy_to_use)
         logger.info(
             f"Admin {admin_id}: TelegramClient created for {label} with SQLiteSession. Caching under admin_id {admin_id}")
@@ -1611,7 +1612,7 @@ async def cb_check_all_sessions(callback: CallbackQuery):
                 if not session_name or not account_data.get("api_id") or not account_data.get("api_hash"):
                     raise ValueError("Missing session_name/api_id/api_hash in DB.")
                 temp_client = TelegramClient(
-                    SQLiteSession(f"sessions/{session_name}"),
+                    SQLiteSession(os.path.join(get_workspace_session_dir(), session_name)),
                     int(account_data.get("api_id")),
                     account_data.get("api_hash"),
                     proxy=build_proxy_params(account_data)

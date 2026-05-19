@@ -1,5 +1,5 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from db import get_db_connection
+from db import get_active_workspace_name, get_db_connection
 
 
 GREEN_DOT = "\U0001F7E2"
@@ -15,6 +15,12 @@ BACK_TO_CHANNELS_TEXT = BACK_ARROW + " \u041d\u0430\u0437\u0430\u0434 \u0432 \u0
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     buttons = [
+        [
+            InlineKeyboardButton(
+                text="\U0001F5C4\uFE0F \u041F\u0440\u043E\u0441\u0442\u0440\u0430\u043D\u0441\u0442\u0432\u043E: " + get_active_workspace_name(),
+                callback_data="workspaces_menu"
+            )
+        ],
         [
             InlineKeyboardButton(text="\u2699\uFE0F \u0410\u043a\u043a\u0430\u0443\u043d\u0442\u044b Telethon", callback_data="account_settings"),
             InlineKeyboardButton(text="\U0001F916 \u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 AI", callback_data="ai_config_menu")

@@ -81,6 +81,7 @@ class AccountManagementStates(StatesGroup):
 
 class GeneralSettingsStates(StatesGroup):
 	Menu = State()
+	WaitingForWorkspaceName = State()
 
 
 class CategoryRegularCommentStates(StatesGroup):
