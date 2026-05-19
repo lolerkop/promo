@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import random
-import re
 import shutil
 import sqlite3
 import time
@@ -35,7 +34,7 @@ from telethon.tl.types import InputUserSelf
 from telethon.tl.types import (InputPrivacyKeyPhoneNumber,
                                InputPrivacyValueDisallowAll)
 
-from db import (add_proxies_bulk, assign_proxy_to_account, delete_all_proxies,
+from db import (add_proxies_bulk, create_account_with_proxy, delete_all_proxies,
                 delete_expired_proxies, delete_proxy, get_account_details,
                 get_active_workspace_id, get_config_value, get_db_connection, get_unassigned_proxy,
                 get_proxy_details, get_proxy_summary,
@@ -46,6 +45,7 @@ from db import (add_proxies_bulk, assign_proxy_to_account, delete_all_proxies,
 from services.proxy_health import (format_proxy_addr, progress_bar,
                                    proxy_display_status,
                                    run_proxy_health_check)
+from services.proxy_parser import parse_proxy_import_line
 from userbot import (ALL_CLIENT_USER_IDS, conversation_tracker,
                      get_active_clients, reinitialize_telethon_client,
                      remove_client_from_runtime, restart_workspace_clients)
@@ -59,94 +59,8 @@ from ..utils import show_accounts_list, user_is_allowed
 logger = logging.getLogger(__name__)
 
 
-def _normalize_proxy_type(value: str | None) -> str | None:
-    value = (value or "").strip().lower()
-    if value == "socks":
-        return "socks5"
-    if value in {"socks5", "socks4", "http"}:
-        return value
-    return None
-
-
-def _looks_like_proxy_expiry(value: str | None) -> bool:
-    value = (value or "").strip()
-    if not value:
-        return False
-    return bool(re.match(
-        r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?$",
-        value
-    ))
-
-
-def _split_proxy_password_and_expiry(password_parts: list[str]) -> tuple[str | None, str | None]:
-    max_expiry_parts = min(4, max(0, len(password_parts) - 1))
-    for expiry_parts_count in range(max_expiry_parts, 0, -1):
-        expires_at = ":".join(password_parts[-expiry_parts_count:]).strip()
-        if _looks_like_proxy_expiry(expires_at):
-            password = ":".join(password_parts[:-expiry_parts_count]) or None
-            return password, expires_at
-    return ":".join(password_parts) or None, None
-
-
-def _build_proxy_import_data(proxy_type: str | None, ip: str, port: str, tail: list[str]) -> dict | None:
-    try:
-        proxy_port = int(port)
-    except (TypeError, ValueError):
-        return None
-
-    proxy_type = _normalize_proxy_type(proxy_type) or "socks5"
-    proxy_username = None
-    proxy_password = None
-    expires_at = None
-
-    if tail:
-        if len(tail) < 2:
-            return None
-
-        inline_type = _normalize_proxy_type(tail[0])
-        if inline_type and len(tail) >= 3:
-            proxy_type = inline_type
-            proxy_username = tail[1] or None
-            password_parts = tail[2:]
-        else:
-            proxy_username = tail[0] or None
-            password_parts = tail[1:]
-
-        proxy_password, expires_at = _split_proxy_password_and_expiry(password_parts)
-
-    return {
-        "proxy_type": proxy_type,
-        "proxy_ip": ip,
-        "proxy_port": proxy_port,
-        "proxy_username": proxy_username,
-        "proxy_password": proxy_password,
-        "expires_at": expires_at,
-        "status": "active",
-    }
-
-
 def _parse_proxy_import_line(line: str) -> dict | None:
-    line = (line or "").strip()
-    if not line or line.startswith("#"):
-        return None
-
-    bracket_match = re.match(
-        r"^(?:(socks5|socks4|http|socks):)?\[([^\]]+)\]:(\d+)(?::(.+))?$",
-        line,
-        flags=re.IGNORECASE
-    )
-    if bracket_match:
-        proxy_type, ip, port, tail_raw = bracket_match.groups()
-        return _build_proxy_import_data(proxy_type, ip, port, tail_raw.split(":") if tail_raw else [])
-
-    parts = line.split(":")
-    proxy_type = _normalize_proxy_type(parts[0]) if parts else None
-    if proxy_type:
-        parts.pop(0)
-
-    if len(parts) < 2:
-        return None
-    return _build_proxy_import_data(proxy_type, parts[0], parts[1], parts[2:])
+    return parse_proxy_import_line(line)
 
 
 def _proxy_display_status(proxy: dict) -> str:
@@ -1208,27 +1122,29 @@ async def finalize_account_add(client: TelegramClient, acc_data_fsm: dict, messa
     logger.info(
         f"Admin {admin_id}: Finalize - Proxy data for DB for {label_for_log}: type={proxy_type}, ip={proxy_ip}, port={proxy_port}")
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
     new_account_db_id = None
     try:
         logger.info(f"Admin {admin_id}: Finalize - Inserting account {session_name_is_label} into DB.")
-        cursor.execute(
-            """INSERT INTO accounts (session_name, phone, api_id, api_hash, label, user_id,
-                                    proxy_type, proxy_ip, proxy_port, proxy_username, proxy_password)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (session_name_is_label, phone, api_id, api_hash, session_name_is_label, user_id_val,
-             proxy_type, proxy_ip, proxy_port, proxy_username, proxy_password)
+        new_account_db_id = create_account_with_proxy(
+            {
+                "session_name": session_name_is_label,
+                "phone": phone,
+                "api_id": api_id,
+                "api_hash": api_hash,
+                "label": session_name_is_label,
+                "user_id": user_id_val,
+                "proxy_type": proxy_type,
+                "proxy_ip": proxy_ip,
+                "proxy_port": proxy_port,
+                "proxy_username": proxy_username,
+                "proxy_password": proxy_password,
+            },
+            proxy_id=proxy_id_to_assign,
         )
-        conn.commit()
-        new_account_db_id = cursor.lastrowid
         logger.info(
             f"Admin {admin_id}: Finalize - Account {session_name_is_label} inserted with DB ID {new_account_db_id}.")
-        if proxy_id_to_assign and new_account_db_id:
-            assign_proxy_to_account(proxy_id_to_assign, new_account_db_id)
 
     except sqlite3.IntegrityError as e_sql:
-        conn.rollback()
         logger.error(f"Admin {admin_id}: Finalize - SQLite IntegrityError for {session_name_is_label}: {e_sql}")
         await message.answer(f"Аккаунт с сессией '{session_name_is_label}' уже существует в БД. Начните заново /start.",
                              reply_markup=main_menu_keyboard())
@@ -1236,8 +1152,6 @@ async def finalize_account_add(client: TelegramClient, acc_data_fsm: dict, messa
         global_reg_cache.pop(admin_id, None)
         await state.clear()
         return
-    finally:
-        conn.close()
 
     client_data_for_userbot = {
         "id": new_account_db_id,

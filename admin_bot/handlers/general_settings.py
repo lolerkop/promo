@@ -73,25 +73,6 @@ def workspaces_menu_keyboard() -> InlineKeyboardMarkup:
 	for workspace in list_workspaces():
 		workspace_id = workspace["id"]
 		name = workspace.get("name") or workspace_id
-		prefix = "✅ " if workspace_id == active_id else "▫️ "
-		buttons.append([
-			InlineKeyboardButton(text=prefix + name, callback_data=f"workspace_switch:{workspace_id}")
-		])
-		if workspace_id != "default":
-			buttons.append([
-				InlineKeyboardButton(text=f"🗑️ Удалить: {name}", callback_data=f"workspace_delete_confirm:{workspace_id}")
-			])
-	buttons.append([InlineKeyboardButton(text="➕ Добавить пространство", callback_data="workspace_add_start")])
-	buttons.append([InlineKeyboardButton(text="⬅️ Назад в общие настройки", callback_data="general_settings_menu")])
-	return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def workspaces_menu_keyboard() -> InlineKeyboardMarkup:
-	active_id = get_active_workspace_id()
-	buttons = []
-	for workspace in list_workspaces():
-		workspace_id = workspace["id"]
-		name = workspace.get("name") or workspace_id
 		is_running = workspace.get("is_running", True)
 		active_prefix = "[активно] " if workspace_id == active_id else ""
 		runtime_prefix = "[запущено] " if is_running else "[остановлено] "

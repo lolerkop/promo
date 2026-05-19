@@ -677,7 +677,7 @@ async def process_category_keyword_input(message: Message, state: FSMContext):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💬 Предустановленная фраза", callback_data="cat_kw_choice_predefined")],
-        [InlineKeyboardButton(text="🤖 OpenAI/G4F генерация", callback_data="cat_kw_choice_openai")],
+        [InlineKeyboardButton(text="🤖 OpenAI генерация", callback_data="cat_kw_choice_openai")],
         [InlineKeyboardButton(text="⬅️ Отмена", callback_data="cancel_cat_kw_add")]
     ])
     await message.answer(f"Ключевое слово для категории: <b>{keyword}</b>. Выберите тип ответа:", reply_markup=kb)

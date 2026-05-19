@@ -5,6 +5,7 @@ import os
 import shutil
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -15,6 +16,10 @@ DB_PATH = os.getenv("DB_PATH", "data/database.sqlite")
 WORKSPACES_DIR = os.getenv("WORKSPACES_DIR", "data/workspaces")
 WORKSPACES_INDEX_PATH = os.path.join(WORKSPACES_DIR, "workspaces.json")
 DEFAULT_WORKSPACE_ID = "default"
+DB_MIGRATIONS = (
+	(1, "runtime_indexes"),
+	(2, "openai_only_provider"),
+)
 _current_workspace_id = contextvars.ContextVar("current_workspace_id", default=None)
 
 
@@ -222,9 +227,29 @@ def get_db_connection():
 	return conn
 
 
+@contextmanager
+def db_transaction():
+	conn = get_db_connection()
+	try:
+		yield conn, conn.cursor()
+		conn.commit()
+	except Exception:
+		conn.rollback()
+		raise
+	finally:
+		conn.close()
+
+
 def create_tables():
 	conn = get_db_connection()
 	c = conn.cursor()
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS schema_migrations (
+		version INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		applied_at TEXT NOT NULL
+	)
+	""")
 	c.execute("""
 	CREATE TABLE IF NOT EXISTS accounts (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -446,6 +471,57 @@ def _add_column_if_not_exists(table_name, column_name, column_def):
 		conn.close()
 
 
+def _migration_runtime_indexes(cursor):
+	cursor.execute("CREATE INDEX IF NOT EXISTS idx_accounts_enabled ON accounts(is_enabled)")
+	cursor.execute("CREATE INDEX IF NOT EXISTS idx_proxies_assignment ON proxies(assigned_account_id)")
+	cursor.execute("CREATE INDEX IF NOT EXISTS idx_groups_enabled ON groups(enabled)")
+	cursor.execute("CREATE INDEX IF NOT EXISTS idx_channels_enabled ON channels(enabled)")
+	cursor.execute("CREATE INDEX IF NOT EXISTS idx_analytics_account_action ON analytics_log(account_id, action_type)")
+	cursor.execute("CREATE INDEX IF NOT EXISTS idx_category_joined_chat_id ON category_joined_chats(chat_id)")
+
+
+def _migration_openai_only_provider(cursor):
+	cursor.execute(
+		"INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+		("ai_provider", "openai")
+	)
+	cursor.execute("DELETE FROM config WHERE key = ?", ("g4f_model",))
+
+
+def run_migrations():
+	migration_handlers = {
+		1: _migration_runtime_indexes,
+		2: _migration_openai_only_provider,
+	}
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("""
+			CREATE TABLE IF NOT EXISTS schema_migrations (
+				version INTEGER PRIMARY KEY,
+				name TEXT NOT NULL,
+				applied_at TEXT NOT NULL
+			)
+		""")
+		c.execute("SELECT version FROM schema_migrations")
+		applied_versions = {row["version"] for row in c.fetchall()}
+		for version, name in DB_MIGRATIONS:
+			if version in applied_versions:
+				continue
+			migration_handlers[version](c)
+			c.execute(
+				"INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+				(version, name, datetime.now(timezone.utc).isoformat(timespec="seconds"))
+			)
+			logging.info(f"Applied DB migration {version}: {name}")
+		conn.commit()
+	except Exception:
+		conn.rollback()
+		raise
+	finally:
+		conn.close()
+
+
 def update_all_tables():
 	create_tables()
 	_add_column_if_not_exists("groups", "assigned_account_id",
@@ -460,6 +536,7 @@ def update_all_tables():
 	_add_column_if_not_exists("proxies", "expires_at", "TEXT")
 	_add_column_if_not_exists("proxies", "last_checked_at", "TEXT")
 	_add_column_if_not_exists("proxies", "last_error", "TEXT")
+	run_migrations()
 
 
 def set_config_value(key: str, value: str):
@@ -1005,6 +1082,34 @@ def get_account_details(account_id: int) -> dict | None:
 	row = c.fetchone()
 	conn.close()
 	return dict(row) if row else None
+
+
+def create_account_with_proxy(account_data: dict, proxy_id: int | None = None) -> int:
+	fields = (
+		"session_name", "phone", "api_id", "api_hash", "label", "user_id",
+		"proxy_type", "proxy_ip", "proxy_port", "proxy_username", "proxy_password"
+	)
+	values = [account_data.get(field) for field in fields]
+	with db_transaction() as (_, cursor):
+		cursor.execute(
+			f"INSERT INTO accounts ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})",
+			values
+		)
+		account_id = cursor.lastrowid
+		if proxy_id:
+			cursor.execute(
+				"""
+				UPDATE proxies
+				SET assigned_account_id = ?
+				WHERE id = ?
+				  AND assigned_account_id IS NULL
+				  AND COALESCE(status, 'active') = 'active'
+				""",
+				(account_id, proxy_id)
+			)
+			if cursor.rowcount != 1:
+				raise sqlite3.IntegrityError(f"Proxy {proxy_id} is not available for assignment.")
+		return account_id
 
 
 def update_account_proxy_settings(account_id: int, proxy_details: dict) -> bool:

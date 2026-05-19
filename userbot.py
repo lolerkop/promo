@@ -34,6 +34,13 @@ from db import (add_analytics_log, get_account_details,
                 list_workspaces, record_account_runtime_event, reset_workspace_context,
                 refresh_expired_proxies, set_config_value,
                 set_workspace_context, update_all_tables)
+from services.rotation import (get_accounts_ordered_for_cycle as rotation_get_accounts_ordered_for_cycle,
+                               get_next_account_in_cycle as rotation_get_next_account_in_cycle,
+                               record_account_cycle_success as rotation_record_account_cycle_success)
+from services.trigger_matching import (chat_id_variants as trigger_chat_id_variants,
+                                       linked_chat_peer_from_db,
+                                       matching_keyword_from_rows,
+                                       sql_placeholders)
 
 try:
 		from admin_bot.reporting_utils import send_report
@@ -89,58 +96,19 @@ def _sync_legacy_runtime_refs():
 
 
 def _chat_id_variants(chat_id) -> tuple[int, ...]:
-		variants: list[int] = []
-		try:
-				base_id = int(chat_id)
-		except (TypeError, ValueError):
-				return tuple()
-
-		def add(value: int):
-				if value not in variants:
-						variants.append(value)
-
-		add(base_id)
-		abs_text = str(abs(base_id))
-		if base_id < 0:
-				if abs_text.startswith("100") and len(abs_text) > 3:
-						raw_channel_id = int(abs_text[3:])
-						add(raw_channel_id)
-						add(-raw_channel_id)
-				else:
-						add(abs(base_id))
-		elif base_id > 0:
-				add(int(f"-100{base_id}"))
-				add(-base_id)
-
-		return tuple(variants)
+		return trigger_chat_id_variants(chat_id)
 
 
 def _sql_placeholders(values: tuple[int, ...]) -> str:
-		return ",".join("?" for _ in values)
+		return sql_placeholders(values)
 
 
 def _linked_chat_peer_from_db(value):
-		text_value = str(value or "").strip()
-		if not text_value:
-				return None
-		try:
-				linked_chat_id = int(text_value)
-		except ValueError:
-				return text_value
-		if linked_chat_id > 0:
-				return int(f"-100{linked_chat_id}")
-		return linked_chat_id
+		return linked_chat_peer_from_db(value)
 
 
 def _matching_global_keyword_from_rows(rows, text: str | None) -> str | None:
-		text_lower = (text or "").lower()
-		if not text_lower:
-				return None
-		for row in rows:
-				keyword = (row["keyword"] or "").lower()
-				if keyword and keyword in text_lower:
-						return keyword
-		return None
+		return matching_keyword_from_rows(rows, text)
 
 
 def _matching_global_keyword_from_db(text: str | None) -> str | None:
@@ -233,77 +201,15 @@ def init_listen_all(value=None):
 
 
 def get_next_account_in_cycle(cycle_name):
-		active_clients = get_active_clients()
-		if not active_clients:
-				logging.warning(f"get_next_account_in_cycle ({cycle_name}): список клиентов пуст!")
-				return (None, None)
-
-		conn = get_db_connection()
-		c = conn.cursor()
-		c.execute("SELECT * FROM cycle_state WHERE cycle_name = ?", (cycle_name,))
-		row = c.fetchone()
-		if not row:
-				c.execute("INSERT INTO cycle_state (cycle_name, last_account_index) VALUES (?, ?)", (cycle_name, 0))
-				conn.commit()
-				last_index = 0
-		else:
-				last_index = row["last_account_index"]
-
-		active_clients_with_data = [(client, data) for client, data in active_clients if client.is_connected()]
-		total_active_clients = len(active_clients_with_data)
-
-		if total_active_clients == 0:
-				logging.warning(f"get_next_account_in_cycle ({cycle_name}): нет активных подключенных клиентов!")
-				conn.close()
-				return (None, None)
-
-		current_index_for_db_update = (last_index + 1) % total_active_clients
-
-		c.execute("UPDATE cycle_state SET last_account_index=? WHERE cycle_name=?",
-							(current_index_for_db_update, cycle_name))
-		conn.commit()
-		conn.close()
-
-		selected_client_tuple = active_clients_with_data[current_index_for_db_update]
-		return selected_client_tuple
+		return rotation_get_next_account_in_cycle(cycle_name, get_active_clients())
 
 
 def get_accounts_ordered_for_cycle(cycle_name):
-		active_clients = get_active_clients()
-		active_clients_with_data = [(client, data) for client, data in active_clients if client.is_connected()]
-		total_active_clients = len(active_clients_with_data)
-		if total_active_clients == 0:
-				logging.warning(f"get_accounts_ordered_for_cycle ({cycle_name}): no connected clients")
-				return []
-
-		conn = get_db_connection()
-		c = conn.cursor()
-		c.execute("SELECT * FROM cycle_state WHERE cycle_name = ?", (cycle_name,))
-		row = c.fetchone()
-		if not row:
-				c.execute("INSERT INTO cycle_state (cycle_name, last_account_index) VALUES (?, ?)", (cycle_name, -1))
-				conn.commit()
-				last_index = -1
-		else:
-				last_index = row["last_account_index"]
-		conn.close()
-
-		start_index = (last_index + 1) % total_active_clients
-		return active_clients_with_data[start_index:] + active_clients_with_data[:start_index]
+		return rotation_get_accounts_ordered_for_cycle(cycle_name, get_active_clients())
 
 
 def record_account_cycle_success(cycle_name, account_db_id):
-		active_clients = get_active_clients()
-		active_clients_with_data = [(client, data) for client, data in active_clients if client.is_connected()]
-		for index, (_, data) in enumerate(active_clients_with_data):
-				if data.get("id") == account_db_id:
-						conn = get_db_connection()
-						c = conn.cursor()
-						c.execute("INSERT OR REPLACE INTO cycle_state (cycle_name, last_account_index) VALUES (?, ?)",
-											(cycle_name, index))
-						conn.commit()
-						conn.close()
-						return
+		return rotation_record_account_cycle_success(cycle_name, account_db_id, get_active_clients())
 
 
 def humanize_ai_text(text: str) -> str:
@@ -371,8 +277,7 @@ def generate_vpn_comment(context: str = None, current_account_id_for_log: int = 
 																																									default_base_prompt_val)
 
 		openai_model_db = get_config_value("openai_model", "gpt-3.5-turbo")
-		g4f_model_db = get_config_value("g4f_model", "gpt-4o-mini")
-		ai_provider_db = get_config_value("ai_provider", "openai_g4f")
+		ai_provider_db = get_config_value("ai_provider", "openai")
 		try:
 				temperature_db = float(get_config_value("ai_temperature", "0.7"))
 		except ValueError:
@@ -404,7 +309,6 @@ def generate_vpn_comment(context: str = None, current_account_id_for_log: int = 
 		ai_result_data = generate_ai_response(
 				messages=messages_for_api,
 				openai_model=openai_model_db,
-				g4f_model=g4f_model_db,
 				provider=ai_provider_db,
 				temperature=temperature_db,
 				max_tokens=max_tokens_db
@@ -853,7 +757,6 @@ async def auto_comment_on_new_topic_handler(event, client_obj, client_data):
 				failure_markers = (
 						"generation failed",
 						"error ai",
-						"g4f",
 						"lm studio generation failed",
 						"\u0438\u0437\u0432\u0438\u043d",
 						"\u043d\u0435 \u0441\u043c\u043e\u0433",

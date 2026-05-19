@@ -8,8 +8,8 @@ from db import get_config_value, set_config_value, update_all_tables
 from services.error_log_handler import install_error_log_handler
 
 from .bot_instance import (DEFAULT_AI_BASE_PROMPT, DEFAULT_AI_MAX_TOKENS,
-                           DEFAULT_AI_TEMPERATURE, DEFAULT_G4F_MODEL,
-                           DEFAULT_OPENAI_MODEL, TEMP_PHOTO_DIR, bot, dp)
+                           DEFAULT_AI_TEMPERATURE, DEFAULT_OPENAI_MODEL,
+                           TEMP_PHOTO_DIR, bot, dp)
 from .handlers import (accounts, ai_config, analytics, channels,
                        chat_categories_settings, common, general_settings,
                        groups, maintenance, profile_update, regular_comment,
@@ -55,8 +55,8 @@ async def main_bot_polling_task():
 
 	default_configs = {
 		"ai_base_prompt": DEFAULT_AI_BASE_PROMPT, "openai_model": DEFAULT_OPENAI_MODEL,
-		"g4f_model": DEFAULT_G4F_MODEL, "ai_temperature": DEFAULT_AI_TEMPERATURE,
-		"ai_provider": "openai_g4f",
+		"ai_temperature": DEFAULT_AI_TEMPERATURE,
+		"ai_provider": "openai",
 		"ai_max_tokens": DEFAULT_AI_MAX_TOKENS,
 		"listen_all": "True",
 		"REGULAR_COMMENT_ENABLED": "0", "REGULAR_COMMENT_INTERVAL": "60",

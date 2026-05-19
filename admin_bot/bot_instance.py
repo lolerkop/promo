@@ -40,6 +40,5 @@ if not os.path.exists(TEMP_PHOTO_DIR):
 
 DEFAULT_AI_BASE_PROMPT = "Ты — копирайтер, который пишет уникальные, интересные и вовлекающие комментарии на разные темы."
 DEFAULT_OPENAI_MODEL = "gpt-3.5-turbo"
-DEFAULT_G4F_MODEL = "gpt-4o-mini"
 DEFAULT_AI_TEMPERATURE = "0.7"
 DEFAULT_AI_MAX_TOKENS = "150"

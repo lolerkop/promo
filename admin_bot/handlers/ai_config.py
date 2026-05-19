@@ -14,8 +14,8 @@ from db import (add_openai_api_key, delete_openai_api_key, get_config_value,
                 update_openai_api_key_status)
 
 from ..bot_instance import (DEFAULT_AI_BASE_PROMPT, DEFAULT_AI_MAX_TOKENS,
-                            DEFAULT_AI_TEMPERATURE, DEFAULT_G4F_MODEL,
-                            DEFAULT_OPENAI_MODEL, bot, dp)
+                            DEFAULT_AI_TEMPERATURE, DEFAULT_OPENAI_MODEL, bot,
+                            dp)
 from ..keyboards import main_menu_keyboard
 from ..states import AIConfigStates
 from ..utils import user_is_allowed
@@ -24,7 +24,6 @@ from ..utils import user_is_allowed
 def ai_config_menu_keyboard() -> InlineKeyboardMarkup:
 	base_prompt = get_config_value("ai_base_prompt", DEFAULT_AI_BASE_PROMPT)
 	openai_model = get_config_value("openai_model", DEFAULT_OPENAI_MODEL)
-	g4f_model = get_config_value("g4f_model", DEFAULT_G4F_MODEL)
 	temp = get_config_value("ai_temperature", DEFAULT_AI_TEMPERATURE)
 	max_tokens = get_config_value("ai_max_tokens", DEFAULT_AI_MAX_TOKENS)
 
@@ -45,8 +44,7 @@ def ai_config_menu_keyboard() -> InlineKeyboardMarkup:
 		[InlineKeyboardButton(text="🔑 Управление API ключами OpenAI", callback_data="manage_openai_keys_menu")],
 		[InlineKeyboardButton(text=use_ai_text, callback_data="change_ai_mode")],
 		[
-			InlineKeyboardButton(text=f"OpenAI модель: {openai_model}", callback_data="set_openai_model"),
-			InlineKeyboardButton(text=f"G4F модель: {g4f_model}", callback_data="set_g4f_model")
+			InlineKeyboardButton(text=f"OpenAI модель: {openai_model}", callback_data="set_openai_model")
 		],
 		[
 			InlineKeyboardButton(text=f"Температура: {temp}", callback_data="set_ai_temp")
@@ -347,24 +345,6 @@ async def process_openai_model(message: Message, state: FSMContext):
 	if not user_is_allowed(message.from_user.id): await message.answer("Нет прав."); return
 	set_config_value("openai_model", message.text.strip())
 	await message.answer("Модель OpenAI обновлена.", reply_markup=ai_config_menu_keyboard())
-	await state.clear()
-
-
-@dp.callback_query(F.data == "set_g4f_model")
-async def cb_set_g4f_model(callback: CallbackQuery, state: FSMContext):
-	if not user_is_allowed(callback.from_user.id): await callback.answer("Нет прав."); return
-	current_val = get_config_value("g4f_model", DEFAULT_G4F_MODEL)
-	await callback.message.edit_text(
-		f"Текущая модель G4F: <code>{current_val}</code>\nВведите название новой модели (например, gpt-4, gpt-3.5-turbo):")
-	await state.set_state(AIConfigStates.WaitingForG4FModel)
-	await callback.answer()
-
-
-@dp.message(AIConfigStates.WaitingForG4FModel, F.text, ~F.text.startswith('/'))
-async def process_g4f_model(message: Message, state: FSMContext):
-	if not user_is_allowed(message.from_user.id): await message.answer("Нет прав."); return
-	set_config_value("g4f_model", message.text.strip())
-	await message.answer("Модель G4F обновлена.", reply_markup=ai_config_menu_keyboard())
 	await state.clear()
 
 

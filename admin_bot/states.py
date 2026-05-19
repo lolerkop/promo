@@ -13,7 +13,6 @@ class MassProfileUpdateStates(StatesGroup):
 class AIConfigStates(StatesGroup):
 	WaitingForBasePrompt = State()
 	WaitingForOpenAIModel = State()
-	WaitingForG4FModel = State()
 	WaitingForTemperature = State()
 	WaitingForMaxTokens = State()
 	WaitingForConvPrompt = State()

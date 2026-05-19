@@ -2,7 +2,6 @@ import logging
 import random
 import re
 
-from g4f.client import Client as G4FClient
 from openai import (APIConnectionError, APIStatusError, AuthenticationError,
                     BadRequestError, OpenAI, PermissionDeniedError,
                     RateLimitError)
@@ -10,40 +9,13 @@ from openai import (APIConnectionError, APIStatusError, AuthenticationError,
 from db import (get_active_openai_api_keys_for_cycle, get_templates,
                 record_openai_key_failure, record_openai_key_usage)
 
-g4f_client = G4FClient()
 TEMPLATE_PATTERN = re.compile(r'(\d+\[[^\]\n]+\])')
-
-
-def _generate_with_g4f(messages, g4f_model, temperature, max_tokens):
-		data = {
-				"content": "Извините, G4F не смог сформировать корректный ответ.",
-				"service_used": "g4f",
-				"success": False,
-		}
-		try:
-				resp = g4f_client.chat.completions.create(
-						model=g4f_model,
-						messages=messages,
-						temperature=temperature,
-						max_tokens=max_tokens,
-				)
-				if resp.choices and resp.choices[0].message and resp.choices[0].message.content:
-						data.update(
-								{"content": resp.choices[0].message.content, "success": True}
-						)
-				else:
-						logging.error("G4F вернул пустую структуру.")
-		except Exception as e:
-				logging.error("Сбой G4F: %s – %s", type(e).__name__, e)
-				data["content"] = "Извините, не удалось сгенерировать ответ через G4F."
-		return data
 
 
 def generate_ai_response(
 				messages,
 				openai_model="gpt-3.5-turbo",
-				g4f_model="gpt-4o-mini",
-				provider="openai_g4f",
+				provider="openai",
 				temperature=0.7,
 				max_tokens=150,
 ):
@@ -54,15 +26,15 @@ def generate_ai_response(
 				"success": False,
 		}
 
-		if provider != "openai_g4f":
-				logging.warning("Unsupported AI provider '%s'. Falling back to OpenAI/G4F.", provider)
+		if provider != "openai":
+				logging.warning("Unsupported AI provider '%s'. Using OpenAI API only.", provider)
 
 		keys = get_active_openai_api_keys_for_cycle()
 		if not keys:
-				logging.warning(
-						"Активные OpenAI-ключи не найдены. Переходим на G4F."
-				)
-				return _generate_with_g4f(messages, g4f_model, temperature, max_tokens)
+				logging.warning("Активные OpenAI-ключи не найдены.")
+				result["content"] = "Ошибка AI: активные OpenAI API ключи не найдены."
+				result["service_used"] = "openai"
+				return result
 
 		for key in keys:
 				key_id, api_key = key["id"], key["api_key"]
@@ -108,8 +80,10 @@ def generate_ai_response(
 						)
 						record_openai_key_failure(key_id)
 
-		logging.warning("Все ключи OpenAI исчерпаны. Переходим на G4F.")
-		return _generate_with_g4f(messages, g4f_model, temperature, max_tokens)
+		logging.warning("Все ключи OpenAI исчерпаны или вернули ошибку.")
+		result["content"] = "Ошибка AI: все OpenAI API ключи недоступны или исчерпаны."
+		result["service_used"] = "openai"
+		return result
 
 def template_response() -> str | None:
 	template = get_templates()

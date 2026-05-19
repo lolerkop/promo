@@ -3,6 +3,5 @@ telethon
 APScheduler
 python-dotenv
 openai>=1.0.0
-g4f
 pysocks
 python-socks
