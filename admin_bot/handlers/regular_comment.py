@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from ..bot_instance import bot
 from ..utils import user_is_allowed
 from ..keyboards import cancel_action_keyboard, main_menu_keyboard
-from db import get_config_value, set_config_value
+from db import get_active_workspace_id, get_config_value, run_in_workspace, set_config_value
 
 
 def _get_main_app_schedule_regular_comment_job_func():
@@ -127,4 +127,8 @@ async def cb_send_regular_comment_now_btn(callback: CallbackQuery):
         return
     await callback.answer("Запускаю отправку регулярного комментария...", show_alert=False)
     # Запускаем как фоновую задачу, чтобы не блокировать бота
-    asyncio.create_task(_send_comment_now_and_notify_admin(callback.message.chat.id, callback.from_user.id))
+    workspace_id = get_active_workspace_id()
+    asyncio.create_task(run_in_workspace(
+        workspace_id,
+        _send_comment_now_and_notify_admin(callback.message.chat.id, callback.from_user.id)
+    ))

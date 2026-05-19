@@ -11,10 +11,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from admin_bot.main import main_bot_polling_task
 from app_core_utils import send_regular_comment_now_core
 from db import (add_analytics_log, create_tables, get_config_value,
-                get_db_connection, update_all_tables)
+                get_current_workspace_id, get_db_connection, list_workspaces,
+                reset_workspace_context, set_workspace_context,
+                update_all_tables)
 from shared import active_background_tasks
 from userbot import (generate_vpn_comment, get_next_account_in_cycle,
-                     start_all_clients)
+                     start_all_clients, stop_all_clients)
 
 try:
     from admin_bot.reporting_utils import send_report
@@ -31,6 +33,7 @@ last_usage_times = {}
 category_last_run_times = {}
 global_last_run_time = None
 regular_scheduler_last_statuses = {}
+regular_scheduler_workspace_states = {}
 
 
 def log_regular_scheduler_status_once(status_key: str, message: str):
@@ -285,13 +288,163 @@ async def regular_comment_task_for_scheduler():
 
 async def main_app_send_regular_comment_now(
         initiated_by_admin: bool = True):
-    global last_usage_times
+    workspace_id = get_current_workspace_id()
+    workspace_state = _get_regular_workspace_state(workspace_id)
     return await send_regular_comment_now_core(initiated_by_admin=initiated_by_admin,
-                                               last_usage_times_param=last_usage_times)
+                                               last_usage_times_param=workspace_state["last_usage_times"])
+
+
+def _get_regular_workspace_state(workspace_id: str) -> dict:
+    return regular_scheduler_workspace_states.setdefault(workspace_id, {
+        "last_usage_times": {},
+        "category_last_run_times": {},
+        "global_last_run_time": None,
+        "statuses": {},
+    })
+
+
+def _log_workspace_regular_status_once(workspace_id: str, status_key: str, message: str):
+    state = _get_regular_workspace_state(workspace_id)
+    statuses = state["statuses"]
+    if statuses.get(status_key) == message:
+        return
+    statuses[status_key] = message
+    logging.info(message)
+
+
+async def _regular_comment_task_for_current_workspace(workspace_id: str, workspace_name: str):
+    state = _get_regular_workspace_state(workspace_id)
+    now = datetime.now()
+    last_usage_times_ws = state["last_usage_times"]
+    category_last_run_times_ws = state["category_last_run_times"]
+
+    if get_config_value("REGULAR_COMMENT_ENABLED", "0") == "1":
+        try:
+            interval_minutes = int(get_config_value("REGULAR_COMMENT_INTERVAL", "60"))
+        except ValueError:
+            interval_minutes = 60
+            _log_workspace_regular_status_once(
+                workspace_id,
+                "regular_global_config",
+                f"[regular_comment_scheduler:{workspace_name}] Invalid REGULAR_COMMENT_INTERVAL, using 60 minutes."
+            )
+
+        global_last_run_time_ws = state.get("global_last_run_time")
+        if global_last_run_time_ws is None or (now - global_last_run_time_ws) >= timedelta(minutes=interval_minutes):
+            state["statuses"].pop("regular_global_wait", None)
+            _log_workspace_regular_status_once(
+                workspace_id,
+                "regular_global",
+                f"[regular_comment_scheduler:{workspace_name}] Global regular comment is due. Interval: {interval_minutes} min."
+            )
+            report_result = await send_regular_comment_now_core(
+                initiated_by_admin=False,
+                last_usage_times_param=last_usage_times_ws
+            )
+            state["global_last_run_time"] = now
+            if report_result.get("sent_to") or report_result.get("failed_for") or report_result.get("error"):
+                formatted_report = format_detailed_report(report_result, f"Regular auto-comment ({workspace_name})")
+                await send_report(**formatted_report)
+        else:
+            next_run_at = global_last_run_time_ws + timedelta(minutes=interval_minutes)
+            _log_workspace_regular_status_once(
+                workspace_id,
+                "regular_global_wait",
+                f"[regular_comment_scheduler:{workspace_name}] Global regular comment is enabled, waiting. Next run after {next_run_at:%Y-%m-%d %H:%M:%S}."
+            )
+    else:
+        _log_workspace_regular_status_once(
+            workspace_id,
+            "regular_global",
+            f"[regular_comment_scheduler:{workspace_name}] Global regular comment is disabled."
+        )
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM chat_categories WHERE regular_comment_enabled = 1")
+    categories = [dict(row) for row in c.fetchall()]
+    conn.close()
+
+    if not categories:
+        _log_workspace_regular_status_once(
+            workspace_id,
+            "regular_categories",
+            f"[regular_comment_scheduler:{workspace_name}] No enabled category regular-comment jobs."
+        )
+    else:
+        _log_workspace_regular_status_once(
+            workspace_id,
+            "regular_categories",
+            f"[regular_comment_scheduler:{workspace_name}] Enabled category regular-comment jobs: {len(categories)}."
+        )
+
+    for category in categories:
+        category_name = category["category_name"]
+        interval = category["regular_comment_interval_minutes"]
+        last_run = category_last_run_times_ws.get(category_name)
+
+        if last_run and (now - last_run) < timedelta(minutes=interval):
+            next_category_run_at = last_run + timedelta(minutes=interval)
+            _log_workspace_regular_status_once(
+                workspace_id,
+                f"regular_category_wait:{category_name}",
+                f"[regular_comment_scheduler:{workspace_name}] Category '{category_name}' is waiting. Next run after {next_category_run_at:%Y-%m-%d %H:%M:%S}."
+            )
+            continue
+
+        state["statuses"].pop(f"regular_category_wait:{category_name}", None)
+        category_last_run_times_ws[category_name] = now
+
+        conn_cats = get_db_connection()
+        c_cats = conn_cats.cursor()
+        c_cats.execute("SELECT chat_id FROM category_joined_chats WHERE category_name = ?", (category_name,))
+        chat_ids = [row['chat_id'] for row in c_cats.fetchall()]
+        conn_cats.close()
+
+        if not chat_ids:
+            await send_report(
+                report_title=f"Auto-comment category: {category_name}",
+                status="Skipped",
+                account_info="N/A",
+                event_details=f"No chats found for category '{category_name}'.",
+            )
+            continue
+
+        report_result_cat = await send_regular_comment_now_core(
+            initiated_by_admin=False,
+            last_usage_times_param=last_usage_times_ws,
+            target_chat_ids=chat_ids,
+            custom_prompt=category["regular_comment_prompt"]
+        )
+
+        formatted_report_cat = format_detailed_report(
+            report_result_cat,
+            f"Auto-comment category: {category_name} ({workspace_name})"
+        )
+        await send_report(**formatted_report_cat)
+
+
+async def regular_comment_task_for_scheduler():
+    for workspace in list_workspaces():
+        if not workspace.get("is_running", True):
+            continue
+        workspace_id = workspace["id"]
+        token = set_workspace_context(workspace_id)
+        try:
+            await _regular_comment_task_for_current_workspace(
+                workspace_id,
+                workspace.get("name") or workspace_id
+            )
+        except Exception as e:
+            logging.error(f"regular_comment_scheduler failed for workspace {workspace_id}: {e}", exc_info=True)
+        finally:
+            reset_workspace_context(token)
 
 
 def main_app_schedule_regular_comment_job():
     global scheduler
+    if scheduler.get_job('regular_comment_central_scheduler'):
+        return
     scheduler.add_job(regular_comment_task_for_scheduler, 'interval', minutes=1, id='regular_comment_central_scheduler')
 
 
@@ -299,11 +452,12 @@ async def main():
     create_tables()
     update_all_tables()
 
-    global last_usage_times, category_last_run_times, global_last_run_time, regular_scheduler_last_statuses
+    global last_usage_times, category_last_run_times, global_last_run_time, regular_scheduler_last_statuses, regular_scheduler_workspace_states
     last_usage_times = {}
     category_last_run_times = {}
     global_last_run_time = None
     regular_scheduler_last_statuses = {}
+    regular_scheduler_workspace_states = {}
 
     logging.info("Запуск клиентских аккаунтов Telethon...")
     telethon_client_tasks = await start_all_clients()
@@ -339,6 +493,7 @@ async def main():
             logging.info("Планировщик остановлен.")
 
         logging.info("Приложение завершило работу.")
+        await stop_all_clients()
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ import logging
 import html
 import os
 from datetime import datetime, timezone
-from db import get_active_workspace_id, get_config_value  # ИСПРАВЛЕНО
+from db import get_config_value, get_current_workspace_id  # ИСПРАВЛЕНО
 from .bot_instance import bot
 
 
@@ -10,12 +10,12 @@ REPORTS_DIR = os.path.join("data", "reports")
 
 
 def _ensure_reports_dir():
-    os.makedirs(os.path.join(REPORTS_DIR, get_active_workspace_id()), exist_ok=True)
+    os.makedirs(os.path.join(REPORTS_DIR, get_current_workspace_id()), exist_ok=True)
 
 
 def get_auto_comment_report_file_path() -> str:
     _ensure_reports_dir()
-    return os.path.join(REPORTS_DIR, get_active_workspace_id(), "auto_comment_reports.txt")
+    return os.path.join(REPORTS_DIR, get_current_workspace_id(), "auto_comment_reports.txt")
 
 
 def clear_auto_comment_report_file():

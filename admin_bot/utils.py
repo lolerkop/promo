@@ -24,7 +24,7 @@ from telethon.utils import get_peer_id
 
 from shared import active_background_tasks
 from db import get_db_connection, get_config_value, add_analytics_log, set_entity_assigned_account, \
-    remove_telethon_account
+    get_active_workspace_id, get_current_workspace_id, remove_telethon_account, run_in_workspace
 from userbot import generate_vpn_comment, get_next_account_in_cycle, get_active_clients
 
 from .bot_instance import bot, allowed_ids, TEMP_PHOTO_DIR
@@ -42,7 +42,11 @@ FATAL_ACCOUNT_ERRORS = (
 )
 
 channel_join_rate_state = {}
-subscription_runtime_loads: dict[int, int] = {}
+subscription_runtime_loads: dict[tuple[str, int], int] = {}
+
+
+def _subscription_runtime_key(account_id: int):
+    return (get_current_workspace_id(), account_id)
 
 
 def _progress_bar(done: int, total: int, width: int = 18) -> str:
@@ -440,7 +444,7 @@ def _order_clients_for_balanced_subscription(clients_pool: list[tuple[TelegramCl
         clients_pool,
         key=lambda item: (
             db_loads.get(item[1].get("id"), 0)
-            + subscription_runtime_loads.get(item[1].get("id"), 0)
+            + subscription_runtime_loads.get(_subscription_runtime_key(item[1].get("id")), 0)
             + runtime_loads.get(item[1].get("id"), 0),
             item[1].get("id") or 0,
         )
@@ -627,7 +631,8 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
                 await join_group_with_client(client, identifier)
                 stats['success'] += 1
                 runtime_loads[account_id] = runtime_loads.get(account_id, 0) + 1
-                subscription_runtime_loads[account_id] = subscription_runtime_loads.get(account_id, 0) + 1
+                runtime_key = _subscription_runtime_key(account_id)
+                subscription_runtime_loads[runtime_key] = subscription_runtime_loads.get(runtime_key, 0) + 1
                 if assigned_account_id is None:
                     assigned_account_id = account_id
 
@@ -639,7 +644,8 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
             except UserAlreadyParticipantError:
                 stats['success'] += 1
                 runtime_loads[account_id] = runtime_loads.get(account_id, 0) + 1
-                subscription_runtime_loads[account_id] = subscription_runtime_loads.get(account_id, 0) + 1
+                runtime_key = _subscription_runtime_key(account_id)
+                subscription_runtime_loads[runtime_key] = subscription_runtime_loads.get(runtime_key, 0) + 1
                 if assigned_account_id is None:
                     assigned_account_id = account_id
 
@@ -675,6 +681,7 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
 
 async def subscribe_groups_bulk_in_bg(admin_chat_id: int, admin_user_id: int, links: list[str]):
     task_id = f"task_{uuid.uuid4().hex[:8]}"
+    workspace_id = get_active_workspace_id()
     description = f"Массовая подписка на {len(links)} групп"
 
     async def task_wrapper():
@@ -820,8 +827,8 @@ async def subscribe_groups_bulk_in_bg(admin_chat_id: int, admin_user_id: int, li
                 del active_background_tasks[task_id]
                 logging.info(f"Task {task_id} ('{description}') finished and removed from registry.")
 
-    task = asyncio.create_task(task_wrapper())
-    active_background_tasks[task_id] = {"task": task, "description": description}
+    task = asyncio.create_task(run_in_workspace(workspace_id, task_wrapper()))
+    active_background_tasks[task_id] = {"task": task, "description": description, "workspace_id": workspace_id}
     await bot.send_message(
         admin_chat_id,
         f"Task '{description}' started with ID: `{task_id}`. Progress will update in one message."
@@ -830,6 +837,7 @@ async def subscribe_groups_bulk_in_bg(admin_chat_id: int, admin_user_id: int, li
 
 async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, identifiers: list[str]):
     task_id = f"task_{uuid.uuid4().hex[:8]}"
+    workspace_id = get_active_workspace_id()
     description = f"Bulk channel subscription for {len(identifiers)} channels"
     batch_size = _get_int_config_value("channel_join_batch_size", 5, 1)
     cooldown_min = _get_int_config_value("channel_join_cooldown_min_seconds", 300, 1)
@@ -999,14 +1007,16 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                     await join_group_with_client(client, identifier, wait_on_flood=False)
                     total_stats['success'] += 1
                     account_state[account_id]['success'] += 1
-                    subscription_runtime_loads[account_id] = subscription_runtime_loads.get(account_id, 0) + 1
+                    runtime_key = _subscription_runtime_key(account_id)
+                    subscription_runtime_loads[runtime_key] = subscription_runtime_loads.get(runtime_key, 0) + 1
                     await mark_attempt(account_id, "successful join")
                     await asyncio.sleep(random.uniform(attempt_gap_min, attempt_gap_max))
                     return True, False
                 except UserAlreadyParticipantError:
                     total_stats['success'] += 1
                     account_state[account_id]['success'] += 1
-                    subscription_runtime_loads[account_id] = subscription_runtime_loads.get(account_id, 0) + 1
+                    runtime_key = _subscription_runtime_key(account_id)
+                    subscription_runtime_loads[runtime_key] = subscription_runtime_loads.get(runtime_key, 0) + 1
                     await mark_attempt(account_id, "already participant")
                     await asyncio.sleep(random.uniform(attempt_gap_min, attempt_gap_max))
                     return True, False
@@ -1175,8 +1185,8 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                 del active_background_tasks[task_id]
                 logging.info(f"Task {task_id} ('{description}') finished and removed from registry.")
 
-    task = asyncio.create_task(task_wrapper())
-    active_background_tasks[task_id] = {"task": task, "description": description}
+    task = asyncio.create_task(run_in_workspace(workspace_id, task_wrapper()))
+    active_background_tasks[task_id] = {"task": task, "description": description, "workspace_id": workspace_id}
     await bot.send_message(
         admin_chat_id,
         f"Task '{description}' started with ID: `{task_id}`. Progress will update in one message."

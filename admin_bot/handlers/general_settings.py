@@ -12,8 +12,10 @@ from admin_bot.states import GeneralSettingsStates, TemplatesState
 from db import (create_workspace, delete_workspace, get_active_workspace_id,
                 get_active_workspace_name, get_config_value, get_templates,
                 list_workspaces, set_config_value, set_template,
+                set_workspace_running,
                 switch_workspace)
-from userbot import init_listen_all, restart_all_clients
+from userbot import (init_listen_all, restart_all_clients,
+                     start_workspace_clients, stop_workspace_clients)
 from shared import active_background_tasks
 
 from ..bot_instance import dp
@@ -22,12 +24,14 @@ from ..utils import user_is_allowed
 TEMPLATE_PATTERN = re.compile(r'^(?:\d+\[[^\]\n]+\](?:\n|\s)?)+$')
 
 
-async def _cancel_workspace_background_tasks():
+async def _cancel_workspace_background_tasks(workspace_id: str = None):
 	for task_id, task_info in list(active_background_tasks.items()):
+		if workspace_id and task_info.get("workspace_id") != workspace_id:
+			continue
 		task = task_info.get("task")
 		if task and not task.done():
 			task.cancel()
-	active_background_tasks.clear()
+		active_background_tasks.pop(task_id, None)
 
 def general_settings_menu_keyboard() -> InlineKeyboardMarkup:
 	subscription_mode = get_config_value("subscription_mode", "all_accounts")
@@ -82,6 +86,36 @@ def workspaces_menu_keyboard() -> InlineKeyboardMarkup:
 	return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def workspaces_menu_keyboard() -> InlineKeyboardMarkup:
+	active_id = get_active_workspace_id()
+	buttons = []
+	for workspace in list_workspaces():
+		workspace_id = workspace["id"]
+		name = workspace.get("name") or workspace_id
+		is_running = workspace.get("is_running", True)
+		active_prefix = "[активно] " if workspace_id == active_id else ""
+		runtime_prefix = "[запущено] " if is_running else "[остановлено] "
+		buttons.append([
+			InlineKeyboardButton(
+				text=active_prefix + runtime_prefix + name,
+				callback_data=f"workspace_switch:{workspace_id}"
+			)
+		])
+		buttons.append([
+			InlineKeyboardButton(
+				text=("Остановить работу" if is_running else "Запустить работу") + f": {name}",
+				callback_data=f"workspace_runtime_toggle:{workspace_id}"
+			)
+		])
+		if workspace_id != "default":
+			buttons.append([
+				InlineKeyboardButton(text=f"Удалить: {name}", callback_data=f"workspace_delete_confirm:{workspace_id}")
+			])
+	buttons.append([InlineKeyboardButton(text="Добавить пространство", callback_data="workspace_add_start")])
+	buttons.append([InlineKeyboardButton(text="Назад в общие настройки", callback_data="general_settings_menu")])
+	return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @dp.callback_query(F.data == "workspaces_menu")
 async def cb_workspaces_menu(callback: CallbackQuery, state: FSMContext):
 	if not user_is_allowed(callback.from_user.id):
@@ -122,7 +156,7 @@ async def process_workspace_name(message: Message, state: FSMContext):
 		return
 	try:
 		workspace = create_workspace(name)
-		await restart_all_clients()
+		await start_workspace_clients(workspace["id"])
 		await state.clear()
 		await message.answer(
 			f"✅ Пространство <b>{workspace['name']}</b> создано и выбрано.",
@@ -143,10 +177,8 @@ async def cb_workspace_switch(callback: CallbackQuery, state: FSMContext):
 		await callback.answer("Это пространство уже активно.")
 		return
 	try:
-		await callback.message.edit_text("Переключаю пространство и перезапускаю аккаунты...")
-		await _cancel_workspace_background_tasks()
+		await callback.message.edit_text("Переключаю интерфейс на выбранное пространство...")
 		workspace = switch_workspace(workspace_id)
-		await restart_all_clients()
 		await state.clear()
 		await callback.message.edit_text(
 			f"✅ Активное пространство: <b>{workspace['name']}</b>",
@@ -155,6 +187,40 @@ async def cb_workspace_switch(callback: CallbackQuery, state: FSMContext):
 		await callback.answer("Переключено.")
 	except Exception as e:
 		await callback.message.edit_text(f"Не удалось переключить пространство: {e}", reply_markup=workspaces_menu_keyboard())
+		await callback.answer("Ошибка.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("workspace_runtime_toggle:"))
+async def cb_workspace_runtime_toggle(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("Нет прав.")
+		return
+	workspace_id = callback.data.split(":", 1)[1]
+	workspace = next((item for item in list_workspaces() if item["id"] == workspace_id), None)
+	if not workspace:
+		await callback.answer("Пространство не найдено.", show_alert=True)
+		return
+	try:
+		if workspace.get("is_running", True):
+			await _cancel_workspace_background_tasks(workspace_id)
+			await stop_workspace_clients(workspace_id)
+			set_workspace_running(workspace_id, False)
+			status_text = "остановлено"
+		else:
+			set_workspace_running(workspace_id, True)
+			await start_workspace_clients(workspace_id)
+			status_text = "запущено"
+		await state.clear()
+		await callback.message.edit_text(
+			f"Работа пространства {status_text}: <b>{workspace.get('name') or workspace_id}</b>",
+			reply_markup=workspaces_menu_keyboard()
+		)
+		await callback.answer(status_text)
+	except Exception as e:
+		await callback.message.edit_text(
+			f"Не удалось изменить работу пространства: {e}",
+			reply_markup=workspaces_menu_keyboard()
+		)
 		await callback.answer("Ошибка.", show_alert=True)
 
 
@@ -187,11 +253,9 @@ async def cb_workspace_delete_execute(callback: CallbackQuery, state: FSMContext
 	workspace_id = callback.data.split(":", 1)[1]
 	try:
 		was_active = workspace_id == get_active_workspace_id()
-		if was_active:
-			await _cancel_workspace_background_tasks()
+		await _cancel_workspace_background_tasks(workspace_id)
+		await stop_workspace_clients(workspace_id)
 		delete_workspace(workspace_id)
-		if was_active:
-			await restart_all_clients()
 		await state.clear()
 		await callback.message.edit_text("✅ Пространство удалено.", reply_markup=workspaces_menu_keyboard())
 		await callback.answer("Удалено.")

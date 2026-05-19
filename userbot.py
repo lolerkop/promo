@@ -28,9 +28,10 @@ from telethon.utils import get_peer_id
 from ai_handler import generate_ai_response, template_response
 from db import (add_analytics_log, get_account_details,
                 get_active_category_prompt_for_chat, get_category_keywords,
-                get_config_value, get_db_connection,
+                get_config_value, get_current_workspace_id, get_db_connection,
                 get_entity_assigned_account_id, get_workspace_session_dir,
-                set_config_value)
+                list_workspaces, reset_workspace_context,
+                set_config_value, set_workspace_context, update_all_tables)
 
 try:
 		from admin_bot.reporting_utils import send_report
@@ -47,6 +48,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 
 clients: list[tuple[TelegramClient, dict]] = []
 ALL_CLIENT_USER_IDS = set()
+workspace_clients: dict[str, list[tuple[TelegramClient, dict]]] = {}
+workspace_client_tasks: dict[str, dict[int, asyncio.Task]] = {}
+workspace_user_ids: dict[str, set[int]] = {}
+cleanup_post_locks_task: asyncio.Task | None = None
 REPLY_DELAY_MIN = 20
 REPLY_DELAY_MAX = 30
 LISTEN_ALL = True
@@ -58,11 +63,30 @@ client_tasks: dict[int, asyncio.Task] = {}
 CLEANUP_INTERVAL_SECONDS = 300
 POST_LOCK_TIMEOUT_SECONDS = 900
 
-currently_processing_posts: dict[tuple[int, int], float] = {}
+currently_processing_posts: dict[tuple, float] = {}
 processing_posts_lock = asyncio.Lock()
 
 
-async def _try_claim_processing_key(key: tuple[int, int], timeout_seconds: int, log_prefix: str,
+def _sync_all_client_user_ids():
+		ALL_CLIENT_USER_IDS.clear()
+		for user_ids in workspace_user_ids.values():
+				ALL_CLIENT_USER_IDS.update(user_ids)
+		for runtime_clients in workspace_clients.values():
+				for _, client_data in runtime_clients:
+						user_id = client_data.get("user_id") if client_data else None
+						if user_id:
+								ALL_CLIENT_USER_IDS.add(user_id)
+
+
+def _sync_legacy_runtime_refs():
+		global clients, client_tasks
+		workspace_id = get_current_workspace_id()
+		clients = workspace_clients.setdefault(workspace_id, [])
+		client_tasks = workspace_client_tasks.setdefault(workspace_id, {})
+		_sync_all_client_user_ids()
+
+
+async def _try_claim_processing_key(key: tuple, timeout_seconds: int, log_prefix: str,
 																		account_label: str, account_db_id: int | None = None) -> bool:
 		async with processing_posts_lock:
 				if key in currently_processing_posts:
@@ -89,8 +113,9 @@ async def _release_processing_key(key: tuple[int, int], log_prefix: str, account
 								f"{log_prefix}: аккаунт {account_label} (ID: {account_db_id}) освободил обработку {key}.")
 
 
-def get_active_clients():
-		return clients
+def get_active_clients(workspace_id: str = None):
+		workspace_id = workspace_id or get_current_workspace_id()
+		return workspace_clients.setdefault(workspace_id, [])
 
 
 async def cleanup_stale_post_locks():
@@ -452,7 +477,8 @@ async def on_new_message_handler(event, client_obj, client_data):
 		account_db_id = client_data.get("id") if client_data else None
 		account_label = client_data.get("label", "N/A") if client_data else "N/A"
 
-		msg_key = (event.chat_id, event.message.id)
+		workspace_id = client_data.get("_workspace_id") if client_data else get_current_workspace_id()
+		msg_key = (workspace_id, event.chat_id, event.message.id)
 		lock_acquired = False
 
 		try:
@@ -528,7 +554,8 @@ async def on_new_message_handler(event, client_obj, client_data):
 						cursor.execute("SELECT id FROM groups WHERE id = ? AND enabled = 1", (chat_id,))
 						manually_added_group = cursor.fetchone()
 
-						should_be_active_in_chat = manually_added_group or is_in_active_category_for_account or LISTEN_ALL
+						listen_all_enabled = get_config_value("listen_all", "True").lower() == "true"
+						should_be_active_in_chat = manually_added_group or is_in_active_category_for_account or listen_all_enabled
 						can_check_global_keywords = should_be_active_in_chat
 
 						if can_check_global_keywords:
@@ -584,7 +611,8 @@ async def auto_comment_on_new_topic_handler(event, client_obj, client_data):
 		coordinator_account_id = client_data.get("id") if client_data else None
 		coordinator_label = client_data.get("label", "Unknown") if client_data else "Unknown"
 
-		post_key = (event.chat_id, event.message.id)
+		workspace_id = client_data.get("_workspace_id") if client_data else get_current_workspace_id()
+		post_key = (workspace_id, event.chat_id, event.message.id)
 		lock_acquired = False
 
 		logging.info(
@@ -784,7 +812,8 @@ async def auto_comment_on_new_topic_handler(event, client_obj, client_data):
 		)
 
 
-async def _create_client_with_handlers(acc_row_data: dict) -> TelegramClient | None:
+async def _create_client_with_handlers(acc_row_data: dict, workspace_id: str = None) -> TelegramClient | None:
+		workspace_id = workspace_id or get_current_workspace_id()
 		db_id = acc_row_data["id"]
 		sname = acc_row_data["session_name"]
 		api_id_val = acc_row_data["api_id"]
@@ -804,7 +833,7 @@ async def _create_client_with_handlers(acc_row_data: dict) -> TelegramClient | N
 						proxy_details_runtime["password"] = acc_row_data["proxy_password"]
 				proxy_params_runtime = proxy_details_runtime
 
-		session = SQLiteSession(os.path.join(get_workspace_session_dir(), sname))
+		session = SQLiteSession(os.path.join(get_workspace_session_dir(workspace_id), sname))
 		client = TelegramClient(session, api_id_val, api_hash_val, proxy=proxy_params_runtime)
 
 		try:
@@ -822,10 +851,12 @@ async def _create_client_with_handlers(acc_row_data: dict) -> TelegramClient | N
 
 				current_client_data_dict = acc_row_data.copy()
 				current_client_data_dict["user_id"] = me.id
+				current_client_data_dict["_workspace_id"] = workspace_id
 
 				@client.on(events.NewMessage(incoming=True))
 				async def combined_message_handler(event: events.NewMessage.Event, current_client_obj=client,
 																					 ccd=current_client_data_dict):
+						set_workspace_context(ccd.get("_workspace_id", workspace_id))
 						if event.sender_id in ALL_CLIENT_USER_IDS:
 								return
 
@@ -1149,6 +1180,229 @@ async def start_all_clients():
 				logging.warning("Ни один клиент не был успешно запущен.")
 
 		return list(client_tasks.values())
+
+
+async def _run_client_until_disconnected_in_workspace(client: TelegramClient, workspace_id: str):
+		token = set_workspace_context(workspace_id)
+		try:
+				await client.run_until_disconnected()
+		finally:
+				reset_workspace_context(token)
+
+
+async def remove_client_from_runtime(account_db_id: int, session_name_for_log: str):
+		workspace_id = get_current_workspace_id()
+		runtime_clients = workspace_clients.setdefault(workspace_id, [])
+		runtime_tasks = workspace_client_tasks.setdefault(workspace_id, {})
+		runtime_user_ids = workspace_user_ids.setdefault(workspace_id, set())
+
+		client_to_disconnect = None
+		user_id_to_remove = None
+		for index, (client_obj, data) in enumerate(list(runtime_clients)):
+				if data.get("id") == account_db_id:
+						client_to_disconnect = client_obj
+						user_id_to_remove = data.get("user_id")
+						runtime_clients.pop(index)
+						break
+
+		task = runtime_tasks.pop(account_db_id, None)
+		if task and not task.done():
+				task.cancel()
+				try:
+						await task
+				except asyncio.CancelledError:
+						pass
+				except Exception as e:
+						logging.debug(f"Client task {workspace_id}:{account_db_id} stopped with error: {e}")
+
+		if user_id_to_remove:
+				runtime_user_ids.discard(user_id_to_remove)
+
+		if client_to_disconnect and client_to_disconnect.is_connected():
+				await client_to_disconnect.disconnect()
+
+		_sync_legacy_runtime_refs()
+		logging.info(f"Client ID {account_db_id} ({session_name_for_log}) removed from workspace {workspace_id}.")
+
+
+async def reinitialize_telethon_client(account_db_id: int) -> tuple[bool, str]:
+		workspace_id = get_current_workspace_id()
+		account_data_from_db = get_account_details(account_db_id)
+		if not account_data_from_db:
+				return False, "Account not found in this workspace database."
+		if not int(account_data_from_db.get("is_enabled", 1) or 0):
+				return False, "Account is disabled in this workspace."
+
+		await remove_client_from_runtime(account_db_id, account_data_from_db.get("session_name", str(account_db_id)))
+
+		new_client = await _create_client_with_handlers(account_data_from_db, workspace_id)
+		if not new_client:
+				return False, "Could not restart Telethon client."
+
+		me = await new_client.get_me()
+		if not me:
+				await new_client.disconnect()
+				return False, "Could not read account profile after restart."
+
+		updated_client_data_dict = account_data_from_db.copy()
+		updated_client_data_dict["user_id"] = me.id
+		updated_client_data_dict["_workspace_id"] = workspace_id
+
+		workspace_clients.setdefault(workspace_id, []).append((new_client, updated_client_data_dict))
+		workspace_user_ids.setdefault(workspace_id, set()).add(me.id)
+		task = asyncio.create_task(_run_client_until_disconnected_in_workspace(new_client, workspace_id))
+		workspace_client_tasks.setdefault(workspace_id, {})[account_db_id] = task
+		_sync_legacy_runtime_refs()
+
+		logging.info(f"Client for account ID {account_db_id} restarted in workspace {workspace_id}.")
+		return True, f"Client {updated_client_data_dict.get('label', account_db_id)} restarted."
+
+
+async def stop_workspace_clients(workspace_id: str):
+		token = set_workspace_context(workspace_id)
+		try:
+				runtime_tasks = workspace_client_tasks.setdefault(workspace_id, {})
+				for account_id, task in list(runtime_tasks.items()):
+						if task and not task.done():
+								task.cancel()
+								try:
+										await task
+								except asyncio.CancelledError:
+										pass
+								except Exception as e:
+										logging.debug(f"Client task {workspace_id}:{account_id} stopped with error: {e}")
+				runtime_tasks.clear()
+
+				for client_obj, client_data in list(workspace_clients.get(workspace_id, [])):
+						try:
+								if client_obj and client_obj.is_connected():
+										await client_obj.disconnect()
+						except Exception as e:
+								logging.warning(f"Failed to disconnect client {workspace_id}:{client_data.get('session_name')}: {e}")
+
+				workspace_clients[workspace_id] = []
+				workspace_user_ids[workspace_id] = set()
+				_sync_legacy_runtime_refs()
+		finally:
+				reset_workspace_context(token)
+
+
+async def stop_all_clients():
+		for workspace in list_workspaces():
+				await stop_workspace_clients(workspace["id"])
+		_sync_legacy_runtime_refs()
+
+
+async def restart_workspace_clients(workspace_id: str = None):
+		workspace_id = workspace_id or get_current_workspace_id()
+		await stop_workspace_clients(workspace_id)
+		return await start_workspace_clients(workspace_id)
+
+
+async def restart_all_clients():
+		await stop_all_clients()
+		return await start_all_clients()
+
+
+async def _ensure_cleanup_post_locks_task():
+		global cleanup_post_locks_task
+		if cleanup_post_locks_task is None or cleanup_post_locks_task.done():
+				cleanup_post_locks_task = asyncio.create_task(cleanup_stale_post_locks())
+				logging.info("Post-lock cleanup task started.")
+
+
+async def start_workspace_clients(workspace_id: str):
+		token = set_workspace_context(workspace_id)
+		try:
+				await _ensure_cleanup_post_locks_task()
+				update_all_tables()
+				init_listen_all()
+
+				existing_tasks = workspace_client_tasks.setdefault(workspace_id, {})
+				if any(task and not task.done() for task in existing_tasks.values()):
+						logging.info(f"Workspace {workspace_id} clients are already running.")
+						return [task for task in existing_tasks.values() if task and not task.done()]
+
+				conn = get_db_connection()
+				c = conn.cursor()
+				accs_from_db = c.execute(
+						"SELECT id, session_name, phone, api_id, api_hash, label, user_id, proxy_type, proxy_ip, proxy_port, proxy_username, proxy_password, is_enabled FROM accounts WHERE COALESCE(is_enabled, 1) = 1"
+				).fetchall()
+				conn.close()
+
+				active_clients_temp = []
+				active_tasks_temp = {}
+				active_user_ids_temp = set()
+
+				if not accs_from_db:
+						logging.warning(f"No enabled accounts to start in workspace {workspace_id}.")
+						workspace_clients[workspace_id] = []
+						workspace_client_tasks[workspace_id] = {}
+						workspace_user_ids[workspace_id] = set()
+						_sync_legacy_runtime_refs()
+						return []
+
+				for acc_row in accs_from_db:
+						db_id = acc_row["id"]
+						sname = acc_row["session_name"]
+						if not all([sname, acc_row["api_id"], acc_row["api_hash"]]):
+								logging.error(f"Skipping account ID={db_id} in workspace {workspace_id}: missing session/api data.")
+								continue
+
+						client_data_dict = dict(acc_row)
+						client_data_dict["_workspace_id"] = workspace_id
+						conversation_tracker[db_id] = defaultdict(int)
+
+						new_client = await _create_client_with_handlers(client_data_dict, workspace_id)
+						if not new_client:
+								add_analytics_log(account_id=db_id, action_type="client_start_fail", details="Client creation/auth failed", success=False)
+								continue
+
+						me = await new_client.get_me()
+						if not me:
+								await new_client.disconnect()
+								add_analytics_log(account_id=db_id, action_type="client_start_fail", details="get_me failed", success=False)
+								continue
+
+						client_data_dict["user_id"] = me.id
+						active_user_ids_temp.add(me.id)
+						if acc_row["user_id"] != me.id:
+								conn_update = get_db_connection()
+								cur_update = conn_update.cursor()
+								cur_update.execute("UPDATE accounts SET user_id = ? WHERE id = ?", (me.id, db_id))
+								conn_update.commit()
+								conn_update.close()
+
+						logging.info(
+								f"[start_workspace_clients] workspace={workspace_id} account={client_data_dict.get('label')} DB_ID={db_id} TG_UID={me.id}")
+						add_analytics_log(account_id=db_id, action_type="client_start_success", details=f"TG_UID: {me.id}", success=True)
+
+						task = asyncio.create_task(_run_client_until_disconnected_in_workspace(new_client, workspace_id))
+						active_tasks_temp[db_id] = task
+						active_clients_temp.append((new_client, client_data_dict))
+
+				workspace_clients[workspace_id] = active_clients_temp
+				workspace_client_tasks[workspace_id] = active_tasks_temp
+				workspace_user_ids[workspace_id] = active_user_ids_temp
+				_sync_legacy_runtime_refs()
+
+				if not active_clients_temp:
+						logging.warning(f"No clients were successfully started in workspace {workspace_id}.")
+
+				return list(active_tasks_temp.values())
+		finally:
+				reset_workspace_context(token)
+
+
+async def start_all_clients():
+		all_tasks = []
+		for workspace in list_workspaces():
+				if not workspace.get("is_running", True):
+						logging.info(f"Workspace {workspace.get('id')} is disabled for runtime; skipping client start.")
+						continue
+				all_tasks.extend(await start_workspace_clients(workspace["id"]))
+		_sync_legacy_runtime_refs()
+		return all_tasks
 
 
 if __name__ == '__main__':

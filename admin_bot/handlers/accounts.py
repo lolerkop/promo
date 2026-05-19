@@ -34,7 +34,7 @@ from telethon.tl.types import (InputPrivacyKeyPhoneNumber,
                                InputPrivacyValueDisallowAll)
 
 from db import (add_proxies_bulk, assign_proxy_to_account, get_account_details,
-                get_config_value, get_db_connection, get_unassigned_proxy,
+                get_active_workspace_id, get_config_value, get_db_connection, get_unassigned_proxy,
                 get_workspace_session_dir,
                 remove_telethon_account, set_config_value,
                 unassign_proxy_for_account, update_account_proxy_settings)
@@ -796,7 +796,8 @@ async def finalize_account_add(client: TelegramClient, acc_data_fsm: dict, messa
         "proxy_ip": proxy_ip,
         "proxy_port": proxy_port,
         "proxy_username": proxy_username,
-        "proxy_password": proxy_password
+        "proxy_password": proxy_password,
+        "_workspace_id": get_active_workspace_id()
     }
     logger.info(
         f"Admin {admin_id}: Finalize - Client data for userbot list for {label_for_log}: {client_data_for_userbot}")

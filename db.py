@@ -1,4 +1,5 @@
 import logging
+import contextvars
 import json
 import os
 import shutil
@@ -14,6 +15,7 @@ DB_PATH = os.getenv("DB_PATH", "data/database.sqlite")
 WORKSPACES_DIR = os.getenv("WORKSPACES_DIR", "data/workspaces")
 WORKSPACES_INDEX_PATH = os.path.join(WORKSPACES_DIR, "workspaces.json")
 DEFAULT_WORKSPACE_ID = "default"
+_current_workspace_id = contextvars.ContextVar("current_workspace_id", default=None)
 
 
 def _default_workspace() -> dict:
@@ -22,6 +24,7 @@ def _default_workspace() -> dict:
 		"name": "Основное",
 		"db_path": DB_PATH,
 		"session_dir": "sessions",
+		"is_running": True,
 	}
 
 
@@ -44,17 +47,36 @@ def _load_workspace_index() -> dict:
 		_save_workspace_index(default_index)
 		return default_index
 
+	changed = False
 	workspaces = index.get("workspaces") or []
 	if not any(ws.get("id") == DEFAULT_WORKSPACE_ID for ws in workspaces):
 		workspaces.insert(0, _default_workspace())
+		changed = True
+	for workspace in workspaces:
+		if "is_running" not in workspace:
+			workspace["is_running"] = True
+			changed = True
 	index["workspaces"] = workspaces
 	if not index.get("active") or not any(ws.get("id") == index.get("active") for ws in workspaces):
 		index["active"] = DEFAULT_WORKSPACE_ID
+		changed = True
+	if changed:
+		_save_workspace_index(index)
 	return index
 
 
 def list_workspaces() -> list[dict]:
 	return list(_load_workspace_index().get("workspaces", []))
+
+
+def get_workspace_by_id(workspace_id: str = None) -> dict:
+	workspace_id = workspace_id or DEFAULT_WORKSPACE_ID
+	for workspace in list_workspaces():
+		if workspace.get("id") == workspace_id:
+			return workspace
+	if workspace_id == DEFAULT_WORKSPACE_ID:
+		return _default_workspace()
+	raise ValueError("Workspace not found.")
 
 
 def get_active_workspace() -> dict:
@@ -74,8 +96,37 @@ def get_active_workspace_name() -> str:
 	return get_active_workspace().get("name", "Основное")
 
 
+def get_current_workspace_id() -> str:
+	return _current_workspace_id.get() or get_active_workspace_id()
+
+
+def get_current_workspace() -> dict:
+	return get_workspace_by_id(get_current_workspace_id())
+
+
+def get_current_workspace_name() -> str:
+	return get_current_workspace().get("name", "Основное")
+
+
+def set_workspace_context(workspace_id: str):
+	get_workspace_by_id(workspace_id)
+	return _current_workspace_id.set(workspace_id)
+
+
+def reset_workspace_context(token):
+	_current_workspace_id.reset(token)
+
+
+async def run_in_workspace(workspace_id: str, awaitable):
+	token = set_workspace_context(workspace_id)
+	try:
+		return await awaitable
+	finally:
+		reset_workspace_context(token)
+
+
 def get_current_db_path() -> str:
-	db_path = get_active_workspace().get("db_path") or DB_PATH
+	db_path = get_current_workspace().get("db_path") or DB_PATH
 	parent = os.path.dirname(db_path)
 	if parent:
 		os.makedirs(parent, exist_ok=True)
@@ -85,12 +136,9 @@ def get_current_db_path() -> str:
 def get_workspace_session_dir(workspace_id: str = None) -> str:
 	workspace = None
 	if workspace_id:
-		for item in list_workspaces():
-			if item.get("id") == workspace_id:
-				workspace = item
-				break
+		workspace = get_workspace_by_id(workspace_id)
 	else:
-		workspace = get_active_workspace()
+		workspace = get_current_workspace()
 	session_dir = (workspace or _default_workspace()).get("session_dir") or "sessions"
 	os.makedirs(session_dir, exist_ok=True)
 	return session_dir
@@ -106,6 +154,7 @@ def create_workspace(name: str) -> dict:
 		"name": clean_name,
 		"db_path": os.path.join(WORKSPACES_DIR, workspace_id, "database.sqlite"),
 		"session_dir": os.path.join("sessions", "workspaces", workspace_id),
+		"is_running": True,
 	}
 	index = _load_workspace_index()
 	index["workspaces"].append(workspace)
@@ -113,6 +162,16 @@ def create_workspace(name: str) -> dict:
 	_save_workspace_index(index)
 	update_all_tables()
 	return workspace
+
+
+def set_workspace_running(workspace_id: str, is_running: bool) -> dict:
+	index = _load_workspace_index()
+	for workspace in index.get("workspaces", []):
+		if workspace.get("id") == workspace_id:
+			workspace["is_running"] = bool(is_running)
+			_save_workspace_index(index)
+			return workspace
+	raise ValueError("Workspace not found.")
 
 
 def switch_workspace(workspace_id: str) -> dict:
