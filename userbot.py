@@ -1102,199 +1102,37 @@ async def _handle_dialogue_logic(event, current_client_obj, current_client_data_
 													response_info="Действие не выполнено", error_info=str(e_dialogue_main))
 
 
-async def reinitialize_telethon_client(account_db_id: int) -> tuple[bool, str]:
-		global clients, ALL_CLIENT_USER_IDS, client_tasks
-
-		account_data_from_db = get_account_details(account_db_id)
-		if not account_data_from_db:
-				return False, "Аккаунт не найден в БД."
-		if not int(account_data_from_db.get("is_enabled", 1) or 0):
-				return False, "Аккаунт выключен в настройках."
-
-		client_index_to_remove = -1
-		old_client_user_id = None
-		for i, (client_obj, client_data_dict) in enumerate(clients):
-				if client_data_dict.get("id") == account_db_id:
-						client_index_to_remove = i
-						old_client_user_id = client_data_dict.get("user_id")
-						logging.info(f"Найден существующий клиент для ID {account_db_id}. Попытка остановки...")
-						if account_db_id in client_tasks and client_tasks[account_db_id]:
-								task = client_tasks.pop(account_db_id)
-								task.cancel()
-								try:
-										await task
-								except asyncio.CancelledError:
-										logging.info(f"Задача для клиента ID {account_db_id} отменена.")
-						if client_obj.is_connected():
-								await client_obj.disconnect()
-						break
-
-		if client_index_to_remove != -1:
-				clients.pop(client_index_to_remove)
-				if old_client_user_id and old_client_user_id in ALL_CLIENT_USER_IDS:
-						ALL_CLIENT_USER_IDS.remove(old_client_user_id)
-				logging.info(f"Старый клиент для ID {account_db_id} удален из runtime.")
-
-		new_client = await _create_client_with_handlers(account_data_from_db)
-		if new_client:
-				me = await new_client.get_me()
-				if me:
-						updated_client_data_dict = account_data_from_db.copy()
-						updated_client_data_dict["user_id"] = me.id
-
-						clients.append((new_client, updated_client_data_dict))
-						ALL_CLIENT_USER_IDS.add(me.id)
-
-						task = asyncio.create_task(new_client.run_until_disconnected())
-						client_tasks[account_db_id] = task
-
-						logging.info(
-								f"Клиент для аккаунта ID {account_db_id} ({updated_client_data_dict['label']}) успешно реинициализирован и запущен.")
-						return True, f"Клиент {updated_client_data_dict['label']} успешно перезапущен с новыми настройками."
-				else:
-						logging.error(f"Не удалось получить 'me' для нового клиента ID {account_db_id} после реинициализации.")
-						await new_client.disconnect()
-						return False, "Не удалось получить информацию о пользователе после перезапуска клиента."
-		else:
-				logging.error(f"Не удалось реинициализировать клиент для аккаунта ID {account_db_id}.")
-				return False, "Не удалось перезапустить клиент с новыми настройками."
-
-
-async def remove_client_from_runtime(account_db_id: int, session_name_for_log: str):
-		global clients, ALL_CLIENT_USER_IDS, client_tasks
-		idx_to_remove = -1
-		user_id_to_remove = None
-		client_to_disconnect = None
-
-		for i, (client_obj, data) in enumerate(clients):
-				if data.get("id") == account_db_id:
-						idx_to_remove = i
-						user_id_to_remove = data.get("user_id")
-						client_to_disconnect = client_obj
-						if account_db_id in client_tasks:
-								client_tasks.pop(account_db_id, None)
-						break
-
-		if idx_to_remove != -1:
-				clients.pop(idx_to_remove)
-
-		if user_id_to_remove and user_id_to_remove in ALL_CLIENT_USER_IDS:
-				ALL_CLIENT_USER_IDS.remove(user_id_to_remove)
-
-		if client_to_disconnect and client_to_disconnect.is_connected():
-				await client_to_disconnect.disconnect()
-
-		logging.info(f"Клиент ID {account_db_id} ({session_name_for_log}) удален из runtime и отключен.")
-
-
-async def stop_all_clients():
-		global clients, ALL_CLIENT_USER_IDS, client_tasks
-		for account_id, task in list(client_tasks.items()):
-				if task and not task.done():
-						task.cancel()
-						try:
-								await task
-						except asyncio.CancelledError:
-								pass
-						except Exception as e:
-								logging.debug(f"Client task {account_id} stopped with error: {e}")
-		client_tasks.clear()
-		for client_obj, client_data in list(clients):
-				try:
-						if client_obj and client_obj.is_connected():
-								await client_obj.disconnect()
-				except Exception as e:
-						logging.warning(f"Failed to disconnect client {client_data.get('session_name')}: {e}")
-		clients = []
-		ALL_CLIENT_USER_IDS.clear()
-
-
-async def restart_all_clients():
-		await stop_all_clients()
-		return await start_all_clients()
-
-
-async def start_all_clients():
-		global conversation_tracker, clients, ALL_CLIENT_USER_IDS, client_tasks
-
-		init_listen_all()
-		asyncio.create_task(cleanup_stale_post_locks())
-		logging.info("Задача очистки старых блокировок постов запущена.")
-
-		conn = get_db_connection()
-		c = conn.cursor()
-		accs_from_db = c.execute(
-				"SELECT id, session_name, phone, api_id, api_hash, label, user_id, proxy_type, proxy_ip, proxy_port, proxy_username, proxy_password, is_enabled FROM accounts WHERE COALESCE(is_enabled, 1) = 1"
-		).fetchall()
-		conn.close()
-
-		if not accs_from_db:
-				logging.warning("Нет аккаунтов в базе данных для запуска.")
-				return []
-
-		active_clients_temp = []
-
-		for acc_row in accs_from_db:
-				db_id = acc_row["id"]
-				sname = acc_row["session_name"]
-
-				if not all([sname, acc_row["api_id"], acc_row["api_hash"]]):
-						logging.error(
-								f"Пропущен аккаунт ID={db_id}, т.к. не все данные заполнены (session, api_id, api_hash).")
-						continue
-
-				client_data_dict = dict(acc_row)
-				conversation_tracker[db_id] = defaultdict(int)
-
-				new_client = await _create_client_with_handlers(client_data_dict)
-
-				if new_client:
-						me = await new_client.get_me()
-						if me:
-								client_data_dict["user_id"] = me.id
-								ALL_CLIENT_USER_IDS.add(me.id)
-								if acc_row["user_id"] != me.id:
-										conn_update = get_db_connection()
-										cur_update = conn_update.cursor()
-										cur_update.execute("UPDATE accounts SET user_id = ? WHERE id = ?", (me.id, db_id))
-										conn_update.commit()
-										conn_update.close()
-										logging.info(f"Обновлен User ID в БД для аккаунта {sname} на {me.id}")
-
-								logging.info(
-										f"[start_all_clients] [{client_data_dict['label']}] Аккаунт запущен (DB_ID={db_id}, TG_UID={client_data_dict['user_id']})")
-								add_analytics_log(account_id=db_id, action_type="client_start_success",
-																	details=f"TG_UID: {client_data_dict['user_id']}", success=True)
-
-								task = asyncio.create_task(new_client.run_until_disconnected())
-								client_tasks[db_id] = task
-								active_clients_temp.append((new_client, client_data_dict))
-
-						else:
-								logging.error(
-										f"Не удалось получить информацию (get_me) для авторизованного аккаунта {sname}. Пропускаем.")
-								await new_client.disconnect()
-								add_analytics_log(account_id=db_id, action_type="client_start_fail", details="get_me failed",
-																	success=False)
-								continue
-				else:
-						add_analytics_log(account_id=db_id, action_type="client_start_fail", details="Client creation/auth failed",
-															success=False)
-
-		clients = active_clients_temp
-
-		if not clients:
-				logging.warning("Ни один клиент не был успешно запущен.")
-
-		return list(client_tasks.values())
-
-
 async def _run_client_until_disconnected_in_workspace(client: TelegramClient, workspace_id: str):
 		token = set_workspace_context(workspace_id)
 		try:
 				await client.run_until_disconnected()
 		finally:
 				reset_workspace_context(token)
+
+
+async def attach_authorized_client_to_runtime(account_db_id: int, client: TelegramClient, account_data: dict,
+																							user_id: int | None = None, workspace_id: str = None):
+		workspace_id = workspace_id or get_current_workspace_id()
+		token = set_workspace_context(workspace_id)
+		try:
+				await remove_client_from_runtime(account_db_id, account_data.get("session_name", str(account_db_id)))
+		finally:
+				reset_workspace_context(token)
+
+		runtime_data = account_data.copy()
+		runtime_data["id"] = account_db_id
+		runtime_data["user_id"] = user_id
+		runtime_data["_workspace_id"] = workspace_id
+
+		workspace_clients.setdefault(workspace_id, []).append((client, runtime_data))
+		if user_id:
+				workspace_user_ids.setdefault(workspace_id, set()).add(user_id)
+		task = asyncio.create_task(_run_client_until_disconnected_in_workspace(client, workspace_id))
+		workspace_client_tasks.setdefault(workspace_id, {})[account_db_id] = task
+		conversation_tracker[account_db_id] = defaultdict(int)
+		_sync_legacy_runtime_refs()
+		logging.info(f"Client for account ID {account_db_id} attached to workspace {workspace_id} runtime.")
+		return task
 
 
 async def remove_client_from_runtime(account_db_id: int, session_name_for_log: str):

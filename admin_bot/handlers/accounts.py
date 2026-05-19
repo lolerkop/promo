@@ -1,4 +1,3 @@
-import asyncio
 import html
 import json
 import logging
@@ -7,7 +6,6 @@ import random
 import shutil
 import sqlite3
 import time
-from collections import defaultdict
 
 from aiogram import F
 from aiogram.filters import StateFilter
@@ -16,21 +14,13 @@ from aiogram.types import (CallbackQuery, Document, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 from telethon import TelegramClient
 from telethon.errors import (ApiIdInvalidError, FloodWaitError,
-                             AuthKeyDuplicatedError, AuthKeyInvalidError,
-                             AuthKeyUnregisteredError, PeerFloodError,
                              PhoneCodeEmptyError, PhoneCodeExpiredError,
                              PhoneCodeHashEmptyError, PhoneCodeInvalidError,
                              PhoneNumberBannedError, PhoneNumberFloodError,
                              PhoneNumberInvalidError, PhonePasswordFloodError,
-                             RPCError, SessionPasswordNeededError,
-                             SessionRevokedError, UserDeactivatedBanError,
-                             UserDeactivatedError, UserRestrictedError)
+                             SessionPasswordNeededError)
 from telethon.sessions import SQLiteSession
-from telethon.tl.functions.account import SetPrivacyRequest, UpdateProfileRequest
-from telethon.tl.functions.photos import UploadProfilePhotoRequest
-from telethon.tl.functions.updates import GetStateRequest
-from telethon.tl.functions.users import GetFullUserRequest
-from telethon.tl.types import InputUserSelf
+from telethon.tl.functions.account import SetPrivacyRequest
 from telethon.tl.types import (InputPrivacyKeyPhoneNumber,
                                InputPrivacyValueDisallowAll)
 
@@ -42,13 +32,18 @@ from db import (add_proxies_bulk, create_account_with_proxy, delete_all_proxies,
                 remove_telethon_account, set_config_value,
                 unassign_proxy_for_account, update_account_proxy_settings,
                 upsert_proxy_for_account)
+from services.account_health import (format_account_health_result,
+                                     run_account_health_check)
 from services.proxy_health import (format_proxy_addr, progress_bar,
                                    proxy_display_status,
                                    run_proxy_health_check)
 from services.proxy_parser import parse_proxy_import_line
-from userbot import (ALL_CLIENT_USER_IDS, conversation_tracker,
-                     get_active_clients, reinitialize_telethon_client,
-                     remove_client_from_runtime, restart_workspace_clients)
+from services.account_profile import (get_account_about, update_bio,
+                                      update_first_name, update_last_name,
+                                      update_profile_photo)
+from userbot import (attach_authorized_client_to_runtime, get_active_clients,
+                     reinitialize_telethon_client, remove_client_from_runtime,
+                     restart_workspace_clients)
 
 from ..bot_instance import TEMP_PHOTO_DIR, bot, dp, global_reg_cache
 from ..keyboards import cancel_action_keyboard, main_menu_keyboard
@@ -178,15 +173,6 @@ def _account_back_keyboard(account_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Back to account", callback_data=f"manage_account:{account_id}")]
     ])
-
-
-async def _get_account_about(client: TelegramClient) -> str:
-    try:
-        full_user = await client(GetFullUserRequest(InputUserSelf()))
-        return getattr(full_user.full_user, "about", None) or "-"
-    except Exception as e:
-        logger.warning(f"Failed to load account bio: {e}")
-        return "-"
 
 
 @dp.callback_query(F.data == "account_settings")
@@ -1060,7 +1046,6 @@ async def handle_account_add_2fa_password(message: Message, state: FSMContext):
 async def finalize_account_add(client: TelegramClient, acc_data_fsm: dict, message: Message, state: FSMContext):
     admin_id = message.from_user.id
     label_for_log = acc_data_fsm.get("label", "UnknownAccount")
-    userbot_clients_list = get_active_clients()
     logger.info(f"Admin {admin_id}: Finalize - Starting for {label_for_log}. FSM data: {acc_data_fsm}")
 
     if not await client.is_user_authorized():
@@ -1168,17 +1153,15 @@ async def finalize_account_add(client: TelegramClient, acc_data_fsm: dict, messa
         "proxy_password": proxy_password,
         "_workspace_id": get_active_workspace_id()
     }
+    await attach_authorized_client_to_runtime(
+        new_account_db_id,
+        client,
+        client_data_for_userbot,
+        user_id=user_id_val,
+        workspace_id=get_active_workspace_id()
+    )
     logger.info(
-        f"Admin {admin_id}: Finalize - Client data for userbot list for {label_for_log}: {client_data_for_userbot}")
-    conversation_tracker[new_account_db_id] = defaultdict(int)
-
-    asyncio.create_task(client.run_until_disconnected())
-    logger.info(f"Admin {admin_id}: Finalize - Client task created for {session_name_is_label}.")
-
-    userbot_clients_list.append((client, client_data_for_userbot))
-    ALL_CLIENT_USER_IDS.add(user_id_val)
-    logger.info(
-        f"Admin {admin_id}: Finalize - Client for {session_name_is_label} added to userbot_clients_list and ALL_CLIENT_USER_IDS.")
+        f"Admin {admin_id}: Finalize - Client for {session_name_is_label} attached to runtime.")
 
     await message.answer(
         f"Аккаунт {phone} (метка/сессия: {session_name_is_label}, UID: {user_id_val}) успешно добавлен и запущен!",
@@ -1407,7 +1390,11 @@ async def cb_profile_edit_menu(callback: CallbackQuery, state: FSMContext):
 
     me = await client.get_me()
     display_name = " ".join(filter(None, [me.first_name, me.last_name])) or client_data.get("label", str(account_id))
-    about = await _get_account_about(client)
+    try:
+        about = await get_account_about(client)
+    except Exception as e:
+        logger.warning(f"Failed to load account bio: {e}")
+        about = "-"
     await state.update_data(current_managing_account_id=account_id)
 
     text = (
@@ -1447,7 +1434,7 @@ async def process_profile_first_name(message: Message, state: FSMContext):
         await state.clear()
         return
     try:
-        await client(UpdateProfileRequest(first_name=message.text.strip()))
+        await update_first_name(client, message.text)
         await message.answer("First name updated.", reply_markup=_account_back_keyboard(account_id))
     except Exception as e:
         await message.answer(f"Failed to update first name: {e}", reply_markup=_account_back_keyboard(account_id))
@@ -1476,7 +1463,7 @@ async def process_profile_last_name(message: Message, state: FSMContext):
         return
     last_name = "" if message.text.strip() == "-" else message.text.strip()
     try:
-        await client(UpdateProfileRequest(last_name=last_name))
+        await update_last_name(client, last_name)
         await message.answer("Last name updated.", reply_markup=_account_back_keyboard(account_id))
     except Exception as e:
         await message.answer(f"Failed to update last name: {e}", reply_markup=_account_back_keyboard(account_id))
@@ -1509,7 +1496,7 @@ async def process_profile_bio(message: Message, state: FSMContext):
                              reply_markup=_account_back_keyboard(account_id))
         return
     try:
-        await client(UpdateProfileRequest(about=bio))
+        await update_bio(client, bio)
         await message.answer("Bio updated.", reply_markup=_account_back_keyboard(account_id))
     except Exception as e:
         await message.answer(f"Failed to update bio: {e}", reply_markup=_account_back_keyboard(account_id))
@@ -1541,8 +1528,7 @@ async def process_profile_photo(message: Message, state: FSMContext):
     photo_path = os.path.join(TEMP_PHOTO_DIR, f"single_profile_{account_id}_{message.message_id}.jpg")
     try:
         await bot.download(message.photo[-1], destination=photo_path)
-        uploaded_file = await client.upload_file(photo_path)
-        await client(UploadProfilePhotoRequest(file=uploaded_file))
+        await update_profile_photo(client, photo_path)
         await message.answer("Avatar updated.", reply_markup=_account_back_keyboard(account_id))
     except Exception as e:
         await message.answer(f"Failed to update avatar: {e}", reply_markup=_account_back_keyboard(account_id))
@@ -1804,259 +1790,101 @@ async def cb_check_all_sessions(callback: CallbackQuery):
         await callback.answer("Access denied.")
         return
 
-    logger.info(f"Admin {admin_id}: Starting enhanced check_all_sessions.")
-    await callback.message.edit_text("Checking all account sessions. This may take a few minutes...")
-    await callback.answer()
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT id, session_name, phone, api_id, api_hash, label, user_id,
-               proxy_type, proxy_ip, proxy_port, proxy_username, proxy_password
-        FROM accounts
-        ORDER BY id
-        """
-    )
-    account_rows = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-
-    chat_id_for_updates = callback.message.chat.id
-    original_message_id_store = {"id": callback.message.message_id}
+    logger.info(f"Admin {admin_id}: Starting account health check.")
     reply_kb_acc_settings = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
             text="\u2B05\uFE0F \u041d\u0430\u0437\u0430\u0434 \u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u043e\u0432",
             callback_data="account_settings"
         )
     ]])
+    last_progress_edit = {"at": 0.0}
 
-    if not account_rows:
-        await bot.send_message(
-            chat_id_for_updates,
-            "No accounts found in database.",
+    async def edit_progress(progress: dict):
+        total = int(progress.get("total") or 0)
+        completed = int(progress.get("completed") or 0)
+        stats = progress.get("stats") or {}
+        current = html.escape(str(progress.get("current") or "-"))
+
+        now = time.monotonic()
+        if completed < total and now - last_progress_edit["at"] < 1.0:
+            return
+        last_progress_edit["at"] = now
+
+        text = (
+            "<b>Проверяю сессии аккаунтов</b>\n\n"
+            f"{progress_bar(completed, total)} <b>{completed}/{total}</b>\n"
+            f"Текущий: <code>{current}</code>\n\n"
+            f"✅ OK: <b>{stats.get('ok', 0)}</b>\n"
+            f"⚠️ Warning: <b>{stats.get('warning', 0)}</b>\n"
+            f"❌ Bad: <b>{stats.get('bad', 0)}</b>\n"
+            f"⏸️ Disabled: <b>{stats.get('disabled', 0)}</b>"
+        )
+        try:
+            await callback.message.edit_text(text, parse_mode="HTML")
+        except Exception as edit_err:
+            logger.debug(f"Admin {admin_id}: health progress edit skipped: {edit_err}")
+
+    await callback.answer("Начинаю проверку.")
+
+    try:
+        result = await run_account_health_check(
+            progress_callback=edit_progress,
+            include_write_probe=True
+        )
+    except Exception as check_err:
+        logger.exception(f"Admin {admin_id}: account health check failed: {check_err}")
+        await callback.message.edit_text(
+            f"❌ Проверка сессий не завершилась: <code>{html.escape(str(check_err)[:500])}</code>",
             reply_markup=reply_kb_acc_settings
         )
         return
 
-    active_clients_by_id = {
-        data.get("id"): (client, data)
-        for client, data in get_active_clients()
-        if data and data.get("id") is not None
-    }
-
-    total_clients = len(account_rows)
-    results = []
-    summary = {"ok": 0, "warning": 0, "bad": 0}
-
-    async def update_progress_message(text_to_set: str):
-        try:
-            await bot.edit_message_text(
-                text_to_set,
-                chat_id=chat_id_for_updates,
-                message_id=original_message_id_store["id"]
-            )
-        except Exception:
-            try:
-                temp_msg = await bot.send_message(chat_id_for_updates, text_to_set)
-                original_message_id_store["id"] = temp_msg.message_id
-            except Exception as send_err:
-                logger.error(f"Admin {admin_id}: Failed to send/edit progress for check_all_sessions: {send_err}")
-
-    def build_proxy_params(account_data: dict):
-        if not account_data.get("proxy_ip") or not account_data.get("proxy_port"):
-            return None
-        proxy = {
-            "proxy_type": (account_data.get("proxy_type") or "socks5").lower(),
-            "addr": account_data.get("proxy_ip"),
-            "port": int(account_data.get("proxy_port")),
-        }
-        if account_data.get("proxy_username"):
-            proxy["username"] = account_data.get("proxy_username")
-        if account_data.get("proxy_password"):
-            proxy["password"] = account_data.get("proxy_password")
-        return proxy
-
-    async def run_health_probe(client: TelegramClient, account_data: dict):
-        warnings = []
-        details = []
-
-        if not client.is_connected():
-            await client.connect()
-        if not client.is_connected():
-            return "bad", "Could not connect to Telegram."
-
-        if not await client.is_user_authorized():
-            return "bad", "Session is not authorized or was revoked."
-
-        me = await client.get_me()
-        if not me:
-            return "bad", "Authorized, but get_me returned no user data."
-
-        full_name = f"{getattr(me, 'first_name', '') or ''} {getattr(me, 'last_name', '') or ''}".strip()
-        details.append(f"Telegram ID: <code>{me.id}</code>")
-        if full_name:
-            details.append(f"Name: <code>{html.escape(full_name)}</code>")
-        username = getattr(me, "username", None)
-        if username:
-            details.append(f"Username: @{html.escape(username)}")
-
-        if getattr(me, "deleted", False):
-            return "bad", "Account user object is marked as deleted/deactivated."
-        if getattr(me, "restricted", False):
-            warnings.append("User object has restricted=True.")
-        restriction_reason = getattr(me, "restriction_reason", None)
-        if restriction_reason:
-            warnings.append(f"Restriction reason present: {html.escape(str(restriction_reason)[:250])}")
-        if getattr(me, "scam", False):
-            warnings.append("Telegram marks this account as scam.")
-        if getattr(me, "fake", False):
-            warnings.append("Telegram marks this account as fake.")
-
-        await client(GetStateRequest())
-        await client(GetFullUserRequest(InputUserSelf()))
-
-        try:
-            probe_message = await client.send_message(
-                "me",
-                "session health check",
-                silent=True,
-                link_preview=False
-            )
-            try:
-                await client.delete_messages("me", [probe_message.id])
-            except Exception as delete_err:
-                warnings.append(f"Self-test message sent, but delete failed: {type(delete_err).__name__}.")
-            details.append("Self-send probe: OK")
-        except (UserRestrictedError, PeerFloodError) as e_write:
-            warnings.append(f"Write probe failed: {type(e_write).__name__}. Possible freeze/restriction.")
-        except RPCError as e_write_rpc:
-            warnings.append(f"Write probe RPC error: {type(e_write_rpc).__name__}.")
-
-        db_user_id = account_data.get("user_id")
-        db_id = account_data.get("id")
-        if db_user_id != me.id:
-            details.append(f"DB UID mismatch: {html.escape(str(db_user_id))} -> {me.id}. Updated.")
-            account_data["user_id"] = me.id
-            conn_uid_update = get_db_connection()
-            cursor_uid_update = conn_uid_update.cursor()
-            try:
-                cursor_uid_update.execute("UPDATE accounts SET user_id = ? WHERE id = ?", (me.id, db_id))
-                conn_uid_update.commit()
-            finally:
-                conn_uid_update.close()
-
-        if warnings:
-            return "warning", "\n".join(details + ["Warnings:"] + [f"- {w}" for w in warnings])
-        return "ok", "\n".join(details)
-
-    fatal_session_errors = (
-        AuthKeyDuplicatedError,
-        AuthKeyInvalidError,
-        AuthKeyUnregisteredError,
-        PhoneNumberBannedError,
-        SessionRevokedError,
-        UserDeactivatedBanError,
-        UserDeactivatedError,
-    )
-
-    for index, account_data in enumerate(account_rows, start=1):
-        db_id = account_data.get("id")
-        s_name = account_data.get("label") or account_data.get("session_name") or f"ID {db_id}"
-        await update_progress_message(f"Checking session {index}/{total_clients}: {html.escape(str(s_name))}...")
-
-        proxy_info = "none"
-        if account_data.get("proxy_ip") and account_data.get("proxy_port"):
-            proxy_info = f"{account_data.get('proxy_type') or 'socks5'}:{account_data.get('proxy_ip')}:{account_data.get('proxy_port')}"
-
-        runtime_pair = active_clients_by_id.get(db_id)
-        temp_client = None
-        client = None
-        source = "runtime"
-        status_kind = "bad"
-        status_details = "Not checked."
-
-        try:
-            if runtime_pair:
-                client = runtime_pair[0]
-            else:
-                source = "temporary"
-                session_name = account_data.get("session_name")
-                if not session_name or not account_data.get("api_id") or not account_data.get("api_hash"):
-                    raise ValueError("Missing session_name/api_id/api_hash in DB.")
-                temp_client = TelegramClient(
-                    SQLiteSession(os.path.join(get_workspace_session_dir(), session_name)),
-                    int(account_data.get("api_id")),
-                    account_data.get("api_hash"),
-                    proxy=build_proxy_params(account_data)
-                )
-                client = temp_client
-
-            status_kind, status_details = await run_health_probe(client, account_data)
-
-        except fatal_session_errors as e_fatal:
-            status_kind = "bad"
-            status_details = f"Fatal session/account error: {type(e_fatal).__name__}. Account is likely banned, deactivated, or session was revoked."
-            logger.warning(f"Admin {admin_id}: fatal session check error for {s_name}: {e_fatal}")
-        except FloodWaitError as e_flood:
-            status_kind = "warning"
-            status_details = f"FloodWait during health check: {e_flood.seconds}s. Account works, but Telegram rate-limited the check."
-            logger.warning(f"Admin {admin_id}: FloodWait checking {s_name}: {e_flood.seconds}s")
-        except RPCError as e_rpc:
-            status_kind = "warning"
-            status_details = f"RPC error during check: {type(e_rpc).__name__}. Details: {html.escape(str(e_rpc)[:250])}"
-            logger.warning(f"Admin {admin_id}: RPC session check error for {s_name}: {e_rpc}")
-        except Exception as e:
-            status_kind = "bad"
-            status_details = f"Check failed: {type(e).__name__}: {html.escape(str(e)[:250])}"
-            logger.error(f"Admin {admin_id}: session check failed for {s_name}: {e}", exc_info=False)
-        finally:
-            if temp_client and temp_client.is_connected():
-                try:
-                    await temp_client.disconnect()
-                except Exception:
-                    pass
-
-        summary[status_kind] += 1
-        icon = {"ok": "\u2705", "warning": "\u26A0\uFE0F", "bad": "\u274C"}.get(status_kind, "?")
-        status_label = {"ok": "OK", "warning": "WARNING", "bad": "BAD"}.get(status_kind, status_kind.upper())
-        runtime_text = "active runtime client" if source == "runtime" else "temporary DB session check"
-        results.append(
-            f"{icon} <b>{html.escape(str(s_name))}</b> | DB ID: <code>{db_id}</code>\n"
-            f"Status: <b>{status_label}</b>\n"
-            f"Source: {runtime_text}\n"
-            f"Proxy: <code>{html.escape(proxy_info)}</code>\n"
-            f"Details:\n{status_details}"
+    total = result.get("total", 0)
+    if not total:
+        await callback.message.edit_text(
+            "Аккаунтов в текущем пространстве пока нет.",
+            reply_markup=reply_kb_acc_settings
         )
-        await asyncio.sleep(random.uniform(0.2, 0.5))
+        return
 
-    try:
-        await bot.delete_message(chat_id=chat_id_for_updates, message_id=original_message_id_store["id"])
-    except Exception:
-        pass
-
-    final_report_header = (
-        "<b>\U0001F3C1 Enhanced session check results</b>\n\n"
-        f"Total: {total_clients}\n"
-        f"\u2705 OK: {summary['ok']}\n"
-        f"\u26A0\uFE0F Warnings: {summary['warning']}\n"
-        f"\u274C Bad: {summary['bad']}\n\n"
+    stats = result.get("stats") or {}
+    header = (
+        "<b>🏁 Проверка сессий завершена</b>\n\n"
+        f"Всего: <b>{total}</b>\n"
+        f"✅ OK: <b>{stats.get('ok', 0)}</b>\n"
+        f"⚠️ Warning: <b>{stats.get('warning', 0)}</b>\n"
+        f"❌ Bad: <b>{stats.get('bad', 0)}</b>\n"
+        f"⏸️ Disabled: <b>{stats.get('disabled', 0)}</b>\n\n"
     )
-
-    current_chunk = final_report_header
-    first_chunk_sent = False
-    for line_content in results:
+    report_lines = [
+        format_account_health_result(item)
+        for item in result.get("results", [])
+    ]
+    chunks = []
+    current_chunk = header
+    for line_content in report_lines:
         chunk_to_add = line_content + "\n\n"
         if len(current_chunk) + len(chunk_to_add) > 3900:
-            await bot.send_message(chat_id_for_updates, current_chunk.strip(), parse_mode="HTML")
-            first_chunk_sent = True
+            chunks.append(current_chunk.strip())
             current_chunk = chunk_to_add
         else:
             current_chunk += chunk_to_add
-
     if current_chunk.strip():
-        await bot.send_message(
-            chat_id_for_updates,
-            current_chunk.strip(),
-            reply_markup=reply_kb_acc_settings,
-            parse_mode="HTML"
-        )
+        chunks.append(current_chunk.strip())
+
+    for index, chunk in enumerate(chunks):
+        is_first = index == 0
+        is_last = index == len(chunks) - 1
+        if is_first:
+            await callback.message.edit_text(
+                chunk,
+                reply_markup=reply_kb_acc_settings if is_last else None,
+                parse_mode="HTML"
+            )
+        else:
+            await bot.send_message(
+                callback.message.chat.id,
+                chunk,
+                reply_markup=reply_kb_acc_settings if is_last else None,
+                parse_mode="HTML"
+            )

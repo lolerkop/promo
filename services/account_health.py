@@ -240,7 +240,20 @@ async def run_account_health_check(progress_callback=None, include_write_probe: 
 
 def format_account_health_result(result: dict) -> str:
 	label = html.escape(str(result.get("label") or result.get("account_id")))
-	status = result.get("status", "unknown")
-	details = html.escape(str(result.get("details") or "")[:160])
-	return f"{label} (ID {result.get('account_id')}): <b>{status}</b> - <code>{details}</code>"
-
+	account_id = html.escape(str(result.get("account_id") or "-"))
+	status = str(result.get("status") or "unknown")
+	status_label = {
+		"ok": "OK",
+		"warning": "WARNING",
+		"bad": "BAD",
+		"disabled": "DISABLED",
+	}.get(status, status.upper())
+	raw_details = str(result.get("details") or "-")
+	if len(raw_details) > 320:
+		raw_details = raw_details[:317] + "..."
+	details = html.escape(raw_details)
+	return (
+		f"<b>{label}</b> | ID: <code>{account_id}</code>\n"
+		f"Status: <b>{status_label}</b>\n"
+		f"Details: <code>{details}</code>"
+	)
