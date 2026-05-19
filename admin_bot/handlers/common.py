@@ -116,8 +116,16 @@ async def cmd_responses(message: Message, state: FSMContext):
         await message.answer("У вас нет прав.")
         return
     await state.clear()
-    await message.answer("🔑 Введите ключевое слово (например, привет, заказ, помощь, впн). Регистр не важен.")
-    await state.set_state("waiting_for_keyword")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить / обновить триггер", callback_data="response_add_start")],
+        [InlineKeyboardButton(text="📋 Список триггеров", callback_data="response_list")],
+        [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="back_to_main_menu")]
+    ])
+    await message.answer(
+        "<b>Ответы на триггеры</b>\n\n"
+        "Добавляй ключевые слова и управляй готовыми ответами.",
+        reply_markup=kb
+    )
 
 
 @dp.message(Command("ai_settings"))

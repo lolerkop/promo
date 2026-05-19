@@ -369,6 +369,7 @@ async def anti_spam_send_reply(event, text, user_id, current_account_id_for_log:
 				"Автоответ на ЛС" if action_details == "dm_auto_reply" else "Ответ на сообщение")
 		status_str = ""
 		error_text_report = ""
+		sent_successfully = False
 		account_info_str = f"<code>{client_label}</code> (ID: {current_account_id_for_log if current_account_id_for_log else 'N/A'})"
 
 		event_text_for_report = event.raw_text if hasattr(event, 'raw_text') else (
@@ -383,6 +384,7 @@ async def anti_spam_send_reply(event, text, user_id, current_account_id_for_log:
 
 		try:
 				await event.reply(text, parse_mode='html', link_preview=False)
+				sent_successfully = True
 				logging.info(f"Ответ отправлен пользователю {user_id}")
 
 				analytics_action = action_details
