@@ -30,7 +30,7 @@ from db import (add_analytics_log, get_account_details,
                 get_account_proxy_block_reason,
                 get_active_category_prompt_for_chat, get_category_keywords,
                 get_config_value, get_current_workspace_id, get_db_connection,
-                get_entity_assigned_account_id, get_workspace_session_dir,
+                get_workspace_session_dir,
                 list_workspaces, record_account_runtime_event, reset_workspace_context,
                 refresh_expired_proxies, set_config_value,
                 set_workspace_context, update_all_tables)
@@ -86,6 +86,68 @@ def _sync_legacy_runtime_refs():
 		clients = workspace_clients.setdefault(workspace_id, [])
 		client_tasks = workspace_client_tasks.setdefault(workspace_id, {})
 		_sync_all_client_user_ids()
+
+
+def _chat_id_variants(chat_id) -> tuple[int, ...]:
+		variants: list[int] = []
+		try:
+				base_id = int(chat_id)
+		except (TypeError, ValueError):
+				return tuple()
+
+		def add(value: int):
+				if value not in variants:
+						variants.append(value)
+
+		add(base_id)
+		abs_text = str(abs(base_id))
+		if base_id < 0:
+				if abs_text.startswith("100") and len(abs_text) > 3:
+						raw_channel_id = int(abs_text[3:])
+						add(raw_channel_id)
+						add(-raw_channel_id)
+				else:
+						add(abs(base_id))
+		elif base_id > 0:
+				add(int(f"-100{base_id}"))
+				add(-base_id)
+
+		return tuple(variants)
+
+
+def _sql_placeholders(values: tuple[int, ...]) -> str:
+		return ",".join("?" for _ in values)
+
+
+def _linked_chat_peer_from_db(value):
+		text_value = str(value or "").strip()
+		if not text_value:
+				return None
+		try:
+				linked_chat_id = int(text_value)
+		except ValueError:
+				return text_value
+		if linked_chat_id > 0:
+				return int(f"-100{linked_chat_id}")
+		return linked_chat_id
+
+
+def _get_group_assigned_account_id(chat_id: int) -> int | None:
+		chat_id_variants = _chat_id_variants(chat_id)
+		if not chat_id_variants:
+				return None
+		conn = get_db_connection()
+		cursor = conn.cursor()
+		try:
+				cursor.execute(
+						f"SELECT assigned_account_id FROM groups WHERE id IN ({_sql_placeholders(chat_id_variants)}) "
+						"AND assigned_account_id IS NOT NULL LIMIT 1",
+						chat_id_variants
+				)
+				row = cursor.fetchone()
+				return row["assigned_account_id"] if row else None
+		finally:
+				conn.close()
 
 
 async def _try_claim_processing_key(key: tuple, timeout_seconds: int, log_prefix: str,
@@ -487,6 +549,7 @@ async def on_new_message_handler(event, client_obj, client_data):
 
 		try:
 				chat_id = event.chat_id
+				chat_id_variants = _chat_id_variants(chat_id)
 				sender_id = event.sender_id
 
 				conn = get_db_connection()
@@ -494,12 +557,13 @@ async def on_new_message_handler(event, client_obj, client_data):
 
 				is_in_active_category_for_account = False
 				category_name_for_chat = None
-				if account_db_id:
-						cursor.execute("""
+				if account_db_id and chat_id_variants:
+						cursor.execute(f"""
 								SELECT cjc.category_name FROM category_joined_chats cjc
 								JOIN chat_categories cc ON cjc.category_name = cc.category_name
-								WHERE cjc.chat_id = ? AND cjc.account_db_id = ? AND cc.is_active = 1 LIMIT 1
-						""", (chat_id, account_db_id))
+								WHERE cjc.chat_id IN ({_sql_placeholders(chat_id_variants)})
+								AND cjc.account_db_id = ? AND cc.is_active = 1 LIMIT 1
+						""", (*chat_id_variants, account_db_id))
 						category_row = cursor.fetchone()
 						if category_row:
 								is_in_active_category_for_account = True
@@ -511,8 +575,7 @@ async def on_new_message_handler(event, client_obj, client_data):
 				should_this_account_respond = True
 
 				if subscription_mode == "single_account_sticky":
-						entity_type_for_db = "group"
-						assigned_account_id_for_entity = get_entity_assigned_account_id(chat_id, entity_type_for_db)
+						assigned_account_id_for_entity = _get_group_assigned_account_id(chat_id)
 						if assigned_account_id_for_entity is not None and assigned_account_id_for_entity != account_db_id:
 								should_this_account_respond = False
 
@@ -555,8 +618,13 @@ async def on_new_message_handler(event, client_obj, client_data):
 										break
 
 				if not processed_by_keyword:
-						cursor.execute("SELECT id FROM groups WHERE id = ? AND enabled = 1", (chat_id,))
-						manually_added_group = cursor.fetchone()
+						manually_added_group = None
+						if chat_id_variants:
+								cursor.execute(
+										f"SELECT id FROM groups WHERE id IN ({_sql_placeholders(chat_id_variants)}) AND enabled = 1 LIMIT 1",
+										chat_id_variants
+								)
+								manually_added_group = cursor.fetchone()
 
 						listen_all_enabled = get_config_value("listen_all", "True").lower() == "true"
 						should_be_active_in_chat = manually_added_group or is_in_active_category_for_account or listen_all_enabled
@@ -701,10 +769,7 @@ async def auto_comment_on_new_topic_handler(event, client_obj, client_data):
 						target_linked_chat_peer = None
 						if linked_chat_id_str and str(linked_chat_id_str).strip():
 								try:
-										try:
-												target_linked_chat_peer = int(linked_chat_id_str)
-										except ValueError:
-												target_linked_chat_peer = linked_chat_id_str
+										target_linked_chat_peer = _linked_chat_peer_from_db(linked_chat_id_str)
 
 										disc_data = await attempt_client(
 												GetDiscussionMessageRequest(peer=event.chat_id, msg_id=event.message.id))
@@ -885,7 +950,8 @@ async def _create_client_with_handlers(acc_row_data: dict, workspace_id: str = N
 								except Exception as e:
 										logging.warning(f"Не удалось получить сообщение, на которое отвечают: {e}")
 
-						if event.is_channel and event.message and not event.message.is_reply and not event.edit_date:
+						if (event.is_channel and not getattr(event, "is_group", False)
+										and event.message and not event.message.is_reply and not event.edit_date):
 								if event.message.date and START_TIME and event.message.date < START_TIME:
 										return
 								await auto_comment_on_new_topic_handler(event, current_client_obj, ccd)
@@ -908,16 +974,22 @@ async def _handle_dialogue_logic(event, current_client_obj, current_client_data_
 
 		conn_check = get_db_connection()
 		c_check = conn_check.cursor()
-		c_check.execute("""
-				SELECT 1 FROM groups WHERE id = ? AND enabled = 1
-				UNION ALL
-				SELECT 1 FROM category_joined_chats cjc
-				JOIN chat_categories cc ON cjc.category_name = cc.category_name
-				WHERE cjc.chat_id = ? AND cc.is_active = 1
-				LIMIT 1
-		""", (event.chat_id, event.chat_id))
-		is_monitored_chat = c_check.fetchone()
-		conn_check.close()
+		chat_id_variants = _chat_id_variants(event.chat_id)
+		is_monitored_chat = None
+		try:
+				if chat_id_variants:
+						placeholders = _sql_placeholders(chat_id_variants)
+						c_check.execute(f"""
+								SELECT 1 FROM groups WHERE id IN ({placeholders}) AND enabled = 1
+								UNION ALL
+								SELECT 1 FROM category_joined_chats cjc
+								JOIN chat_categories cc ON cjc.category_name = cc.category_name
+								WHERE cjc.chat_id IN ({placeholders}) AND cc.is_active = 1
+								LIMIT 1
+						""", (*chat_id_variants, *chat_id_variants))
+						is_monitored_chat = c_check.fetchone()
+		finally:
+				conn_check.close()
 
 		if not is_monitored_chat:
 				logging.info(f"Диалог в чате {event.chat_id} проигнорирован, т.к. чат не отслеживается в БД.")

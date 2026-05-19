@@ -1528,8 +1528,23 @@ async def auto_handle_linked_chat_and_add_to_groups(admin_chat_id: int, main_cha
         return {"success": False,
                 "message": f"Не удалось финализировать информацию о связанной группе (ID: {linked_chat_id_from_api})."}
 
+    linked_chat_peer_id = get_peer_id(linked_chat_entity)
+    if str(main_channel_info.get("linked_chat_id")) != str(linked_chat_peer_id):
+        conn_update_lc = get_db_connection()
+        cursor_update_lc = conn_update_lc.cursor()
+        try:
+            cursor_update_lc.execute(
+                "UPDATE channels SET linked_chat_id = ? WHERE id = ?",
+                (str(linked_chat_peer_id), main_channel_id)
+            )
+            conn_update_lc.commit()
+        except Exception as e_db_lc:
+            logging.error(f"РћС€РёР±РєР° РѕР±РЅРѕРІР»РµРЅРёСЏ linked_chat_id РІ Р‘Р” РґР»СЏ РєР°РЅР°Р»Р° {main_channel_id}: {e_db_lc}")
+        finally:
+            conn_update_lc.close()
+
     linked_chat_info_dict = {
-        "id": linked_chat_entity.id,
+        "id": linked_chat_peer_id,
         "username": getattr(linked_chat_entity, "username", None),
         "title": getattr(linked_chat_entity, "title", str(linked_chat_entity.id))
     }
@@ -1537,7 +1552,7 @@ async def auto_handle_linked_chat_and_add_to_groups(admin_chat_id: int, main_cha
         linked_chat_info_dict['id'])
 
     identifier_for_join_call = linked_chat_info_dict["username"] if linked_chat_info_dict["username"] else str(
-        linked_chat_info_dict["id"])
+        linked_chat_id_from_api)
 
     await bot.send_message(admin_chat_id,
                            f"Найдена связанная группа: <b>{html.escape(linked_chat_display_name)}</b> (ID: {linked_chat_info_dict['id']}). Подписываю аккаунты используя '{identifier_for_join_call}'...")
