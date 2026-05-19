@@ -1388,8 +1388,12 @@ def add_proxies_bulk(proxies: list[dict]) -> tuple[int, int]:
 			expires_at = proxy.get('expires_at')
 			if expires_at and len(str(expires_at).strip()) == 10:
 				expires_at = f"{str(expires_at).strip()} 23:59:59"
+			parsed_expires_at = _parse_proxy_datetime(expires_at)
+			if expires_at and not parsed_expires_at:
+				logging.warning(f"Ignoring invalid proxy expiration value for {proxy.get('proxy_ip')}:{proxy.get('proxy_port')}: {expires_at}")
+				expires_at = None
 			status = proxy.get('status') or 'active'
-			if _parse_proxy_datetime(expires_at) and _parse_proxy_datetime(expires_at) <= datetime.now(timezone.utc):
+			if parsed_expires_at and parsed_expires_at <= datetime.now(timezone.utc):
 				status = 'expired'
 			c.execute("""
 				INSERT INTO proxies (proxy_type, proxy_ip, proxy_port, proxy_username, proxy_password, status, expires_at)
@@ -1423,13 +1427,14 @@ def get_unassigned_proxy() -> dict | None:
 		FROM proxies
 		WHERE assigned_account_id IS NULL
 		  AND COALESCE(status, 'active') = 'active'
-		  AND (expires_at IS NULL OR expires_at = '' OR datetime(expires_at) > datetime('now'))
 		ORDER BY RANDOM()
-		LIMIT 1
 	""")
-	row = c.fetchone()
+	rows = [dict(row) for row in c.fetchall()]
 	conn.close()
-	return dict(row) if row else None
+	for row in rows:
+		if not _proxy_is_expired(row):
+			return row
+	return None
 
 
 def assign_proxy_to_account(proxy_id: int, account_id: int):

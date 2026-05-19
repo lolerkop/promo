@@ -59,51 +59,94 @@ from ..utils import show_accounts_list, user_is_allowed
 logger = logging.getLogger(__name__)
 
 
+def _normalize_proxy_type(value: str | None) -> str | None:
+    value = (value or "").strip().lower()
+    if value == "socks":
+        return "socks5"
+    if value in {"socks5", "socks4", "http"}:
+        return value
+    return None
+
+
+def _looks_like_proxy_expiry(value: str | None) -> bool:
+    value = (value or "").strip()
+    if not value:
+        return False
+    return bool(re.match(
+        r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?$",
+        value
+    ))
+
+
+def _split_proxy_password_and_expiry(password_parts: list[str]) -> tuple[str | None, str | None]:
+    max_expiry_parts = min(4, max(0, len(password_parts) - 1))
+    for expiry_parts_count in range(max_expiry_parts, 0, -1):
+        expires_at = ":".join(password_parts[-expiry_parts_count:]).strip()
+        if _looks_like_proxy_expiry(expires_at):
+            password = ":".join(password_parts[:-expiry_parts_count]) or None
+            return password, expires_at
+    return ":".join(password_parts) or None, None
+
+
+def _build_proxy_import_data(proxy_type: str | None, ip: str, port: str, tail: list[str]) -> dict | None:
+    try:
+        proxy_port = int(port)
+    except (TypeError, ValueError):
+        return None
+
+    proxy_type = _normalize_proxy_type(proxy_type) or "socks5"
+    proxy_username = None
+    proxy_password = None
+    expires_at = None
+
+    if tail:
+        if len(tail) < 2:
+            return None
+
+        inline_type = _normalize_proxy_type(tail[0])
+        if inline_type and len(tail) >= 3:
+            proxy_type = inline_type
+            proxy_username = tail[1] or None
+            password_parts = tail[2:]
+        else:
+            proxy_username = tail[0] or None
+            password_parts = tail[1:]
+
+        proxy_password, expires_at = _split_proxy_password_and_expiry(password_parts)
+
+    return {
+        "proxy_type": proxy_type,
+        "proxy_ip": ip,
+        "proxy_port": proxy_port,
+        "proxy_username": proxy_username,
+        "proxy_password": proxy_password,
+        "expires_at": expires_at,
+        "status": "active",
+    }
+
+
 def _parse_proxy_import_line(line: str) -> dict | None:
     line = (line or "").strip()
     if not line or line.startswith("#"):
         return None
 
     bracket_match = re.match(
-        r"^(?:(socks5|socks4|http):)?\[([^\]]+)\]:(\d+)(?::([^:]*):([^:]*))?(?::(.+))?$",
+        r"^(?:(socks5|socks4|http|socks):)?\[([^\]]+)\]:(\d+)(?::(.+))?$",
         line,
         flags=re.IGNORECASE
     )
     if bracket_match:
-        proxy_type, ip, port, username, password, expires_at = bracket_match.groups()
-        return {
-            "proxy_type": (proxy_type or "socks5").lower(),
-            "proxy_ip": ip,
-            "proxy_port": int(port),
-            "proxy_username": username or None,
-            "proxy_password": password or None,
-            "expires_at": expires_at.strip() if expires_at else None,
-            "status": "active",
-        }
+        proxy_type, ip, port, tail_raw = bracket_match.groups()
+        return _build_proxy_import_data(proxy_type, ip, port, tail_raw.split(":") if tail_raw else [])
 
     parts = line.split(":")
-    proxy_type = "socks5"
-    if parts and parts[0].lower() in {"socks5", "socks4", "http"}:
-        proxy_type = parts.pop(0).lower()
+    proxy_type = _normalize_proxy_type(parts[0]) if parts else None
+    if proxy_type:
+        parts.pop(0)
 
-    if len(parts) not in {2, 4, 5}:
+    if len(parts) < 2:
         return None
-
-    proxy_data = {
-        "proxy_type": proxy_type,
-        "proxy_ip": parts[0],
-        "proxy_port": int(parts[1]),
-        "proxy_username": None,
-        "proxy_password": None,
-        "expires_at": None,
-        "status": "active",
-    }
-    if len(parts) >= 4:
-        proxy_data["proxy_username"] = parts[2] or None
-        proxy_data["proxy_password"] = parts[3] or None
-    if len(parts) == 5:
-        proxy_data["expires_at"] = parts[4].strip() or None
-    return proxy_data
+    return _build_proxy_import_data(proxy_type, parts[0], parts[1], parts[2:])
 
 
 def _proxy_display_status(proxy: dict) -> str:
@@ -1148,6 +1191,19 @@ async def finalize_account_add(client: TelegramClient, acc_data_fsm: dict, messa
     proxy_username = acc_data_fsm.get("proxy_username")
     proxy_password = acc_data_fsm.get("proxy_password")
     proxy_id_to_assign = acc_data_fsm.get("proxy_id")
+
+    if not proxy_id_to_assign:
+        free_proxy = get_unassigned_proxy()
+        if free_proxy:
+            proxy_id_to_assign = free_proxy["id"]
+            proxy_type = free_proxy.get("proxy_type")
+            proxy_ip = free_proxy.get("proxy_ip")
+            proxy_port = free_proxy.get("proxy_port")
+            proxy_username = free_proxy.get("proxy_username")
+            proxy_password = free_proxy.get("proxy_password")
+            await message.answer(
+                f"Найден свободный прокси перед сохранением: {proxy_ip}:{proxy_port}. Привязываю к аккаунту..."
+            )
 
     logger.info(
         f"Admin {admin_id}: Finalize - Proxy data for DB for {label_for_log}: type={proxy_type}, ip={proxy_ip}, port={proxy_port}")
