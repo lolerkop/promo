@@ -5,13 +5,14 @@ import os
 from aiogram.types import BotCommand
 
 from db import get_config_value, set_config_value, update_all_tables
+from services.error_log_handler import install_error_log_handler
 
 from .bot_instance import (DEFAULT_AI_BASE_PROMPT, DEFAULT_AI_MAX_TOKENS,
                            DEFAULT_AI_TEMPERATURE, DEFAULT_G4F_MODEL,
                            DEFAULT_OPENAI_MODEL, TEMP_PHOTO_DIR, bot, dp)
 from .handlers import (accounts, ai_config, analytics, channels,
                        chat_categories_settings, common, general_settings,
-                       groups, profile_update, regular_comment,
+                       groups, maintenance, profile_update, regular_comment,
                        reporting_settings, responses, task_management)
 
 
@@ -28,12 +29,14 @@ async def set_bot_commands():
 		BotCommand(command="reporting", description="⚙️ Настройки Отчетов"),
 		BotCommand(command="chat_categories", description="🗂️ Категории чатов"),
 		BotCommand(command="general_settings", description="🛠️ Общие настройки"),
-		BotCommand(command="tasks", description="📌 Управление задачами")
+		BotCommand(command="tasks", description="📌 Управление задачами"),
+		BotCommand(command="maintenance", description="🩺 Состояние и обслуживание")
 	]
 	await bot.set_my_commands(commands)
 
 
 async def main_bot_polling_task():
+	install_error_log_handler()
 	if not os.path.exists(TEMP_PHOTO_DIR):
 		try:
 			os.makedirs(TEMP_PHOTO_DIR)
@@ -68,7 +71,10 @@ async def main_bot_polling_task():
 		"welcome_message_enabled": "False",
 		"subscription_mode": "all_accounts",
 		"subscription_accounts_per_entity": "5",
-		"use_ai": "True"
+		"use_ai": "True",
+		"maintenance_auto_checks_enabled": "1",
+		"proxy_auto_check_interval_minutes": "360",
+		"account_auto_check_interval_minutes": "720"
 	}
 	for key, value in default_configs.items():
 		if get_config_value(key) is None:

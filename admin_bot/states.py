@@ -84,6 +84,10 @@ class GeneralSettingsStates(StatesGroup):
 	WaitingForWorkspaceName = State()
 
 
+class MaintenanceStates(StatesGroup):
+	WaitingForRestoreBackup = State()
+
+
 class CategoryRegularCommentStates(StatesGroup):
 	WaitingForInterval = State()
 	WaitingForPrompt = State()

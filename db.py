@@ -293,6 +293,58 @@ def create_tables():
 	""")
 
 	c.execute("""
+	CREATE TABLE IF NOT EXISTS account_health (
+		account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+		status TEXT DEFAULT 'unknown',
+		last_checked_at TEXT,
+		details TEXT,
+		telegram_user_id INTEGER,
+		is_authorized INTEGER DEFAULT 0
+	)
+	""")
+
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS account_runtime_state (
+		account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+		action_type TEXT NOT NULL,
+		day_key TEXT,
+		attempts_today INTEGER DEFAULT 0,
+		successes_today INTEGER DEFAULT 0,
+		failures_today INTEGER DEFAULT 0,
+		last_action_at TEXT,
+		last_success_at TEXT,
+		last_failure_at TEXT,
+		cooldown_until TEXT,
+		last_error TEXT,
+		PRIMARY KEY (account_id, action_type)
+	)
+	""")
+
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS bot_error_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		timestamp TEXT NOT NULL,
+		level TEXT NOT NULL,
+		source TEXT,
+		message TEXT NOT NULL,
+		details TEXT,
+		account_id INTEGER,
+		FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE SET NULL
+	)
+	""")
+
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS health_check_runs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		check_type TEXT NOT NULL,
+		started_at TEXT NOT NULL,
+		finished_at TEXT,
+		status TEXT,
+		details TEXT
+	)
+	""")
+
+	c.execute("""
 	CREATE TABLE IF NOT EXISTS chat_categories (
 		category_name TEXT PRIMARY KEY,
 		is_active INTEGER DEFAULT 0,
@@ -487,6 +539,276 @@ def clear_analytics_logs():
 		return False
 	finally:
 		conn.close()
+
+
+def update_account_health_status(
+		account_id: int,
+		status: str,
+		details: str = "",
+		telegram_user_id: int = None,
+		is_authorized: bool = False
+):
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("""
+			INSERT INTO account_health (
+				account_id, status, last_checked_at, details, telegram_user_id, is_authorized
+			)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(account_id) DO UPDATE SET
+				status = excluded.status,
+				last_checked_at = excluded.last_checked_at,
+				details = excluded.details,
+				telegram_user_id = excluded.telegram_user_id,
+				is_authorized = excluded.is_authorized
+		""", (
+			account_id,
+			status,
+			datetime.now(timezone.utc).isoformat(timespec="seconds"),
+			details,
+			telegram_user_id,
+			1 if is_authorized else 0
+		))
+		conn.commit()
+	except Exception as e:
+		print(f"Error updating account health: {e}")
+	finally:
+		conn.close()
+
+
+def get_account_health_summary() -> dict:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("SELECT status, COUNT(*) AS cnt FROM account_health GROUP BY status")
+	rows = c.fetchall()
+	conn.close()
+	summary = {"ok": 0, "warning": 0, "bad": 0, "disabled": 0, "unknown": 0}
+	for row in rows:
+		status = row["status"] or "unknown"
+		summary[status] = row["cnt"]
+	return summary
+
+
+def list_account_health(limit: int = 20) -> list[dict]:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("""
+		SELECT h.*, a.label, a.session_name, a.phone, a.is_enabled
+		FROM account_health h
+		LEFT JOIN accounts a ON a.id = h.account_id
+		ORDER BY h.last_checked_at DESC
+		LIMIT ?
+	""", (limit,))
+	rows = [dict(row) for row in c.fetchall()]
+	conn.close()
+	return rows
+
+
+def record_account_runtime_event(
+		account_id: int,
+		action_type: str,
+		success: bool,
+		cooldown_until: str = None,
+		last_error: str = None
+):
+	if not account_id or not action_type:
+		return
+	now = datetime.now(timezone.utc)
+	day_key = now.strftime("%Y-%m-%d")
+	now_text = now.isoformat(timespec="seconds")
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("""
+			SELECT day_key, attempts_today, successes_today, failures_today
+			FROM account_runtime_state
+			WHERE account_id = ? AND action_type = ?
+		""", (account_id, action_type))
+		row = c.fetchone()
+		if row and row["day_key"] == day_key:
+			attempts = int(row["attempts_today"] or 0) + 1
+			successes = int(row["successes_today"] or 0) + (1 if success else 0)
+			failures = int(row["failures_today"] or 0) + (0 if success else 1)
+		else:
+			attempts = 1
+			successes = 1 if success else 0
+			failures = 0 if success else 1
+
+		c.execute("""
+			INSERT INTO account_runtime_state (
+				account_id, action_type, day_key, attempts_today, successes_today,
+				failures_today, last_action_at, last_success_at, last_failure_at,
+				cooldown_until, last_error
+			)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(account_id, action_type) DO UPDATE SET
+				day_key = excluded.day_key,
+				attempts_today = excluded.attempts_today,
+				successes_today = excluded.successes_today,
+				failures_today = excluded.failures_today,
+				last_action_at = excluded.last_action_at,
+				last_success_at = COALESCE(excluded.last_success_at, account_runtime_state.last_success_at),
+				last_failure_at = COALESCE(excluded.last_failure_at, account_runtime_state.last_failure_at),
+				cooldown_until = excluded.cooldown_until,
+				last_error = excluded.last_error
+		""", (
+			account_id,
+			action_type,
+			day_key,
+			attempts,
+			successes,
+			failures,
+			now_text,
+			now_text if success else None,
+			None if success else now_text,
+			cooldown_until,
+			None if success else (last_error or "")
+		))
+		conn.commit()
+	except Exception as e:
+		print(f"Error recording account runtime event: {e}")
+	finally:
+		conn.close()
+
+
+def set_account_runtime_cooldown(account_id: int, action_type: str, cooldown_until: str, reason: str = None):
+	if not account_id or not action_type:
+		return
+	conn = get_db_connection()
+	c = conn.cursor()
+	now = datetime.now(timezone.utc)
+	day_key = now.strftime("%Y-%m-%d")
+	now_text = now.isoformat(timespec="seconds")
+	try:
+		c.execute("""
+			INSERT INTO account_runtime_state (
+				account_id, action_type, day_key, last_action_at, cooldown_until, last_error
+			)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(account_id, action_type) DO UPDATE SET
+				day_key = excluded.day_key,
+				last_action_at = excluded.last_action_at,
+				cooldown_until = excluded.cooldown_until,
+				last_error = excluded.last_error
+		""", (account_id, action_type, day_key, now_text, cooldown_until, reason))
+		conn.commit()
+	except Exception as e:
+		print(f"Error setting account cooldown: {e}")
+	finally:
+		conn.close()
+
+
+def list_account_runtime_state(limit: int = 50) -> list[dict]:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("""
+		SELECT s.*, a.label, a.session_name, a.phone
+		FROM account_runtime_state s
+		LEFT JOIN accounts a ON a.id = s.account_id
+		ORDER BY COALESCE(s.last_action_at, '') DESC
+		LIMIT ?
+	""", (limit,))
+	rows = [dict(row) for row in c.fetchall()]
+	conn.close()
+	return rows
+
+
+def record_bot_error(level: str, source: str, message: str, details: str = None, account_id: int = None):
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("""
+			INSERT INTO bot_error_log (timestamp, level, source, message, details, account_id)
+			VALUES (?, ?, ?, ?, ?, ?)
+		""", (
+			datetime.now(timezone.utc).isoformat(timespec="seconds"),
+			level,
+			source,
+			message,
+			details,
+			account_id
+		))
+		conn.commit()
+	except Exception:
+		pass
+	finally:
+		conn.close()
+
+
+def list_bot_errors(limit: int = 50) -> list[dict]:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("""
+		SELECT e.*, a.label, a.session_name
+		FROM bot_error_log e
+		LEFT JOIN accounts a ON a.id = e.account_id
+		ORDER BY e.id DESC
+		LIMIT ?
+	""", (limit,))
+	rows = [dict(row) for row in c.fetchall()]
+	conn.close()
+	return rows
+
+
+def clear_bot_errors() -> int:
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("SELECT COUNT(*) AS cnt FROM bot_error_log")
+		count = c.fetchone()["cnt"]
+		c.execute("DELETE FROM bot_error_log")
+		conn.commit()
+		return count
+	except Exception:
+		conn.rollback()
+		return 0
+	finally:
+		conn.close()
+
+
+def count_bot_errors() -> int:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("SELECT COUNT(*) AS cnt FROM bot_error_log")
+	count = c.fetchone()["cnt"]
+	conn.close()
+	return count
+
+
+def record_health_check_run(check_type: str, started_at: str, status: str, details: str = None):
+	conn = get_db_connection()
+	c = conn.cursor()
+	try:
+		c.execute("""
+			INSERT INTO health_check_runs (check_type, started_at, finished_at, status, details)
+			VALUES (?, ?, ?, ?, ?)
+		""", (
+			check_type,
+			started_at,
+			datetime.now(timezone.utc).isoformat(timespec="seconds"),
+			status,
+			details
+		))
+		conn.commit()
+	except Exception as e:
+		print(f"Error recording health check run: {e}")
+	finally:
+		conn.close()
+
+
+def list_health_check_runs(limit: int = 10) -> list[dict]:
+	conn = get_db_connection()
+	c = conn.cursor()
+	c.execute("""
+		SELECT *
+		FROM health_check_runs
+		ORDER BY id DESC
+		LIMIT ?
+	""", (limit,))
+	rows = [dict(row) for row in c.fetchall()]
+	conn.close()
+	return rows
 
 
 def get_active_category_prompt_for_chat(chat_id: int) -> str | None:

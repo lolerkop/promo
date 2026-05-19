@@ -38,12 +38,14 @@ from telethon.tl.types import (InputPrivacyKeyPhoneNumber,
 from db import (add_proxies_bulk, assign_proxy_to_account, delete_all_proxies,
                 delete_expired_proxies, delete_proxy, get_account_details,
                 get_active_workspace_id, get_config_value, get_db_connection, get_unassigned_proxy,
-                get_all_proxies_for_check, get_proxy_details,
-                get_proxy_summary, get_workspace_session_dir, list_proxies,
+                get_proxy_details, get_proxy_summary,
+                get_workspace_session_dir, list_proxies,
                 remove_telethon_account, set_config_value,
-                update_proxy_check_result,
                 unassign_proxy_for_account, update_account_proxy_settings,
                 upsert_proxy_for_account)
+from services.proxy_health import (format_proxy_addr, progress_bar,
+                                   proxy_display_status,
+                                   run_proxy_health_check)
 from userbot import (ALL_CLIENT_USER_IDS, conversation_tracker,
                      get_active_clients, reinitialize_telethon_client,
                      remove_client_from_runtime, restart_workspace_clients)
@@ -106,13 +108,7 @@ def _parse_proxy_import_line(line: str) -> dict | None:
 
 def _proxy_display_status(proxy: dict) -> str:
     status = (proxy.get("computed_status") or proxy.get("status") or "active").lower()
-    if status == "expired":
-        return "истек"
-    if status == "failed":
-        return "не работает"
-    if status == "disabled":
-        return "выключен"
-    return "активный"
+    return proxy_display_status(status)
 
 
 def _proxy_owner_text(proxy: dict) -> str:
@@ -121,63 +117,6 @@ def _proxy_owner_text(proxy: dict) -> str:
         return "свободен"
     label = proxy.get("account_label") or proxy.get("account_session_name") or proxy.get("account_phone") or "аккаунт"
     return f"{label} (ID {account_id})"
-
-
-def _format_proxy_addr(proxy: dict) -> str:
-    return f"{proxy.get('proxy_type') or 'socks5'}://{proxy.get('proxy_ip')}:{proxy.get('proxy_port')}"
-
-
-def _progress_bar(done: int, total: int, width: int = 16) -> str:
-    if total <= 0:
-        return "[" + "-" * width + "]"
-    filled = int(width * min(done, total) / total)
-    return "[" + "#" * filled + "-" * (width - filled) + "]"
-
-
-def _proxy_type_to_pysocks(proxy_type: str):
-    import socks
-
-    normalized = (proxy_type or "socks5").lower()
-    if normalized == "socks5":
-        return socks.SOCKS5
-    if normalized == "socks4":
-        return socks.SOCKS4
-    if normalized == "http":
-        return socks.HTTP
-    raise ValueError(f"Unsupported proxy type: {proxy_type}")
-
-
-def _check_proxy_connectivity_sync(proxy: dict, timeout: int = 12) -> tuple[bool, int | None, str | None]:
-    import socks
-
-    targets = (
-        ("149.154.167.50", 443),
-        ("91.108.56.100", 443),
-    )
-    last_error = None
-    for host, port in targets:
-        sock = socks.socksocket()
-        started_at = time.monotonic()
-        try:
-            sock.set_proxy(
-                proxy_type=_proxy_type_to_pysocks(proxy.get("proxy_type")),
-                addr=proxy.get("proxy_ip"),
-                port=int(proxy.get("proxy_port")),
-                username=proxy.get("proxy_username") or None,
-                password=proxy.get("proxy_password") or None,
-            )
-            sock.settimeout(timeout)
-            sock.connect((host, port))
-            latency_ms = int((time.monotonic() - started_at) * 1000)
-            return True, latency_ms, None
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {str(e)[:220]}"
-        finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
-    return False, None, last_error or "Proxy connection failed."
 
 
 def _proxy_management_keyboard(page: int, total_pages: int, proxies_on_page: list[dict]) -> InlineKeyboardMarkup:
@@ -230,7 +169,7 @@ def _build_proxy_management_text(page: int) -> tuple[str, InlineKeyboardMarkup]:
             expires_at = proxy.get("expires_at") or "не указан"
             last_checked = proxy.get("last_checked_at") or "не проверялся"
             last_error = proxy.get("last_error") or "-"
-            proxy_addr = _format_proxy_addr(proxy)
+            proxy_addr = format_proxy_addr(proxy)
             lines.extend([
                 f"<b>#{proxy['id']}</b> <code>{html.escape(proxy_addr)}</code>",
                 f"Статус: <b>{html.escape(_proxy_display_status(proxy))}</b>",
@@ -412,86 +351,55 @@ async def cb_proxy_pool_check_all(callback: CallbackQuery, state: FSMContext):
         return
 
     await state.clear()
-    proxies = get_all_proxies_for_check()
-    total = len(proxies)
-    if not proxies:
-        text, keyboard = _build_proxy_management_text(page=1)
-        await callback.message.edit_text("Прокси для проверки пока нет.\n\n" + text, reply_markup=keyboard)
-        await callback.answer("Прокси нет.")
-        return
-
-    stats = {"active": 0, "failed": 0, "expired": 0}
-    affected_accounts = set()
-    result_lines = []
-    completed = 0
     last_edit_at = 0.0
-    lock = asyncio.Lock()
 
-    async def edit_progress(force: bool = False):
+    async def edit_progress(progress: dict, force: bool = False):
         nonlocal last_edit_at
         now = time.monotonic()
         if not force and now - last_edit_at < 1.5:
             return
         last_edit_at = now
-        progress = _progress_bar(completed, total)
-        tail = "\n".join(result_lines[-8:])
+        total = progress.get("total", 0)
+        completed = progress.get("completed", 0)
+        stats = progress.get("stats", {})
+        result_lines = progress.get("result_lines", [])
+        tail_lines = []
+        for item in result_lines[-8:]:
+            tail_lines.append(
+                f"#{item['id']} <code>{html.escape(item['addr'])}</code> - "
+                f"<b>{html.escape(proxy_display_status(item['status']))}</b>: "
+                f"<code>{html.escape(str(item['text'])[:140])}</code>"
+            )
+        tail = "\n".join(tail_lines)
         try:
             await callback.message.edit_text(
                 "<b>Проверяю прокси</b>\n\n"
-                f"{progress} <b>{completed}/{total}</b>\n"
-                f"Рабочие: <b>{stats['active']}</b>\n"
-                f"Не работают: <b>{stats['failed']}</b>\n"
-                f"Истекли: <b>{stats['expired']}</b>\n\n"
+                f"{progress_bar(completed, total)} <b>{completed}/{total}</b>\n"
+                f"Рабочие: <b>{stats.get('active', 0)}</b>\n"
+                f"Не работают: <b>{stats.get('failed', 0)}</b>\n"
+                f"Истекли: <b>{stats.get('expired', 0)}</b>\n\n"
                 f"{tail or 'Жду первые результаты...'}"
             )
         except Exception as e:
             logger.debug(f"Failed to update proxy check progress: {e}")
 
-    async def check_one(proxy: dict):
-        nonlocal completed
-        proxy_id = int(proxy["id"])
-        proxy_addr = _format_proxy_addr(proxy)
-        computed_status = (proxy.get("computed_status") or proxy.get("status") or "active").lower()
-
-        if computed_status == "expired":
-            result_status = "expired"
-            result_text = "истек по дате"
-            error_text = "Rental expiration time has passed."
-        else:
-            ok, latency_ms, error = await asyncio.to_thread(_check_proxy_connectivity_sync, proxy)
-            if ok:
-                result_status = "active"
-                result_text = f"OK {latency_ms} ms"
-                error_text = None
-            else:
-                result_status = "failed"
-                result_text = error or "не удалось подключиться"
-                error_text = result_text
-
-        async with lock:
-            update_proxy_check_result(proxy_id, result_status, error_text[:500] if error_text else None)
-            completed += 1
-            stats[result_status] += 1
-            if result_status in {"failed", "expired"} and proxy.get("assigned_account_id"):
-                affected_accounts.add(int(proxy["assigned_account_id"]))
-            result_lines.append(
-                f"#{proxy_id} <code>{html.escape(proxy_addr)}</code> - "
-                f"<b>{html.escape(_proxy_display_status({'status': result_status}))}</b>: "
-                f"<code>{html.escape(str(result_text)[:140])}</code>"
-            )
-            await edit_progress(force=completed == total)
-
     await callback.answer("Начинаю проверку.")
-    await edit_progress(force=True)
+    result = await run_proxy_health_check(
+        concurrency=5,
+        progress_callback=lambda progress: edit_progress(
+            progress,
+            force=progress.get("completed", 0) == progress.get("total", 0)
+        )
+    )
 
-    semaphore = asyncio.Semaphore(5)
+    total = result["total"]
+    if total == 0:
+        text, keyboard = _build_proxy_management_text(page=1)
+        await callback.message.edit_text("Прокси для проверки пока нет.\n\n" + text, reply_markup=keyboard)
+        return
 
-    async def limited_check(proxy: dict):
-        async with semaphore:
-            await check_one(proxy)
-
-    await asyncio.gather(*(limited_check(proxy) for proxy in proxies))
-
+    affected_accounts = result["affected_accounts"]
+    stats = result["stats"]
     if affected_accounts:
         await callback.message.edit_text(
             "<b>Проверка прокси завершена.</b>\n\n"

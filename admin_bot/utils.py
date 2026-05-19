@@ -7,6 +7,7 @@ import sqlite3
 import string
 import html
 import uuid
+from datetime import datetime, timezone
 
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from telethon import TelegramClient
@@ -24,7 +25,8 @@ from telethon.utils import get_peer_id
 
 from shared import active_background_tasks
 from db import get_db_connection, get_config_value, add_analytics_log, set_entity_assigned_account, \
-    get_active_workspace_id, get_current_workspace_id, remove_telethon_account, run_in_workspace
+    get_active_workspace_id, get_current_workspace_id, record_account_runtime_event, \
+    remove_telethon_account, run_in_workspace, set_account_runtime_cooldown
 from userbot import generate_vpn_comment, get_next_account_in_cycle, get_active_clients
 
 from .bot_instance import bot, allowed_ids, TEMP_PHOTO_DIR
@@ -111,6 +113,10 @@ def _get_int_config_value(key: str, default: int, min_value: int = 1) -> int:
         return default
 
 
+def _cooldown_until_iso(seconds_from_now: int) -> str:
+    return datetime.fromtimestamp(time.time() + max(0, int(seconds_from_now)), timezone.utc).isoformat(timespec="seconds")
+
+
 async def _wait_for_channel_join_slot(client_data: dict, admin_chat_id: int):
     account_key = client_data.get("id") or client_data.get("session_name") or client_data.get("label")
     label = client_data.get("label") or client_data.get("session_name") or str(account_key)
@@ -128,6 +134,8 @@ async def _wait_for_channel_join_slot(client_data: dict, admin_chat_id: int):
 
     if state["cooldown_until"] > now:
         sleep_for = int(state["cooldown_until"] - now)
+        if isinstance(account_key, int):
+            set_account_runtime_cooldown(account_key, "join", _cooldown_until_iso(sleep_for), "join batch cooldown")
         logging.info(f"CHANNEL_JOIN_LIMIT: account {label} is cooling down for {sleep_for}s.")
         if sleep_for >= 30:
             try:
@@ -144,6 +152,8 @@ async def _wait_for_channel_join_slot(client_data: dict, admin_chat_id: int):
     if state["attempts"] >= batch_size:
         cooldown = random.randint(cooldown_min, cooldown_max)
         state["cooldown_until"] = time.monotonic() + cooldown
+        if isinstance(account_key, int):
+            set_account_runtime_cooldown(account_key, "join", _cooldown_until_iso(cooldown), "join batch cooldown")
         logging.info(
             f"CHANNEL_JOIN_LIMIT: account {label} reached {batch_size} channel join attempts. Resting {cooldown}s.")
         try:
@@ -585,12 +595,14 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
                 break
 
             label = client_data.get('label', 'N/A')
+            account_id = client_data.get("id")
             logging.info(f"[STICKY MODE] Попытка #{i + 1} для '{identifier}' с аккаунтом '{label}'")
 
             try:
                 await join_group_with_client(client, identifier)
                 stats['success'] += 1
-                assigned_account_id = client_data.get("id")
+                assigned_account_id = account_id
+                record_account_runtime_event(account_id, "join", True)
                 logging.info(f"Аккаунт '{label}' успешно подписался на '{identifier}' и был назначен.")
                 break
 
@@ -599,21 +611,25 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
                     f"Аккаунт '{label}' неактивен (Причина: {type(e).__name__}). Удаляю и пробую следующий.")
                 await handle_banned_account(client_data, e, admin_chat_id)
                 stats['deleted'] += 1
+                record_account_runtime_event(account_id, "join", False, last_error=type(e).__name__)
                 continue
 
             except (InviteHashExpiredError, InviteHashInvalidError, ValueError, ChannelPrivateError, RPCError) as e:
                 stats['failed'] += 1
+                record_account_runtime_event(account_id, "join", False, last_error=f"{type(e).__name__}: {e}")
                 logging.warning(f"Не удалось присоединить '{label}' к '{identifier}': {type(e).__name__} - {e}")
                 break
 
             except UserAlreadyParticipantError:
                 stats['success'] += 1
-                assigned_account_id = client_data.get("id")
+                assigned_account_id = account_id
+                record_account_runtime_event(account_id, "join", True)
                 logging.info(f"Аккаунт '{label}' уже в чате '{identifier}' и был назначен.")
                 break
 
             except Exception as e:
                 stats['failed'] += 1
+                record_account_runtime_event(account_id, "join", False, last_error=f"{type(e).__name__}: {e}")
                 logging.error(f"Непредвиденная ошибка при присоединении '{label}' к '{identifier}': {e}", exc_info=True)
                 break
 
@@ -630,6 +646,7 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
             try:
                 await join_group_with_client(client, identifier)
                 stats['success'] += 1
+                record_account_runtime_event(account_id, "join", True)
                 runtime_loads[account_id] = runtime_loads.get(account_id, 0) + 1
                 runtime_key = _subscription_runtime_key(account_id)
                 subscription_runtime_loads[runtime_key] = subscription_runtime_loads.get(runtime_key, 0) + 1
@@ -640,9 +657,11 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
                 logging.warning(f"РђРєРєР°СѓРЅС‚ '{label}' РЅРµР°РєС‚РёРІРµРЅ (РџСЂРёС‡РёРЅР°: {type(e).__name__}). РЈРґР°Р»СЏСЋ.")
                 await handle_banned_account(client_data, e, admin_chat_id)
                 stats['deleted'] += 1
+                record_account_runtime_event(account_id, "join", False, last_error=type(e).__name__)
 
             except UserAlreadyParticipantError:
                 stats['success'] += 1
+                record_account_runtime_event(account_id, "join", True)
                 runtime_loads[account_id] = runtime_loads.get(account_id, 0) + 1
                 runtime_key = _subscription_runtime_key(account_id)
                 subscription_runtime_loads[runtime_key] = subscription_runtime_loads.get(runtime_key, 0) + 1
@@ -651,6 +670,7 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
 
             except Exception as e:
                 stats['failed'] += 1
+                record_account_runtime_event(account_id, "join", False, last_error=f"{type(e).__name__}: {e}")
                 logging.warning(f"РќРµ СѓРґР°Р»РѕСЃСЊ РїСЂРёСЃРѕРµРґРёРЅРёС‚СЊ '{label}' Рє '{identifier}': {type(e).__name__} - {e}")
 
             await asyncio.sleep(random.uniform(0.5, 1.5))
@@ -658,20 +678,25 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
     else:
         for client, client_data in clients_to_try:
             label = client_data.get('label', 'N/A')
+            account_id = client_data.get("id")
             try:
                 await join_group_with_client(client, identifier)
                 stats['success'] += 1
+                record_account_runtime_event(account_id, "join", True)
 
             except FATAL_ACCOUNT_ERRORS as e:
                 logging.warning(f"Аккаунт '{label}' неактивен (Причина: {type(e).__name__}). Удаляю.")
                 await handle_banned_account(client_data, e, admin_chat_id)
                 stats['deleted'] += 1
+                record_account_runtime_event(account_id, "join", False, last_error=type(e).__name__)
 
             except UserAlreadyParticipantError:
                 stats['success'] += 1
+                record_account_runtime_event(account_id, "join", True)
 
             except Exception as e:
                 stats['failed'] += 1
+                record_account_runtime_event(account_id, "join", False, last_error=f"{type(e).__name__}: {e}")
                 logging.warning(f"Не удалось присоединить '{label}' к '{identifier}': {type(e).__name__} - {e}")
 
             await asyncio.sleep(random.uniform(0.5, 1.5))
@@ -945,6 +970,7 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                     cooldown = random.randint(cooldown_min, cooldown_max)
                     state['available_at'] = time.time() + cooldown
                     state['attempts_in_batch'] = 0
+                    set_account_runtime_cooldown(account_id, "join", _cooldown_until_iso(cooldown), reason)
                     logging.info(f"Bulk channels: account {account_id} cooldown for {cooldown}s after {reason}.")
                     await update_progress(
                         status=f"Account {account_id}: rest {cooldown // 60}m {cooldown % 60}s after {batch_size} join attempts.",
@@ -1007,6 +1033,7 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                     await join_group_with_client(client, identifier, wait_on_flood=False)
                     total_stats['success'] += 1
                     account_state[account_id]['success'] += 1
+                    record_account_runtime_event(account_id, "join", True)
                     runtime_key = _subscription_runtime_key(account_id)
                     subscription_runtime_loads[runtime_key] = subscription_runtime_loads.get(runtime_key, 0) + 1
                     await mark_attempt(account_id, "successful join")
@@ -1015,6 +1042,7 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                 except UserAlreadyParticipantError:
                     total_stats['success'] += 1
                     account_state[account_id]['success'] += 1
+                    record_account_runtime_event(account_id, "join", True)
                     runtime_key = _subscription_runtime_key(account_id)
                     subscription_runtime_loads[runtime_key] = subscription_runtime_loads.get(runtime_key, 0) + 1
                     await mark_attempt(account_id, "already participant")
@@ -1026,6 +1054,13 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                     cooldown = int(e.seconds) + random.randint(60, 180)
                     account_state[account_id]['available_at'] = time.time() + cooldown
                     account_state[account_id]['attempts_in_batch'] = 0
+                    record_account_runtime_event(
+                        account_id,
+                        "join",
+                        False,
+                        cooldown_until=_cooldown_until_iso(cooldown),
+                        last_error=f"FloodWait {e.seconds}s"
+                    )
                     logging.warning(f"Bulk channels: FloodWait for account {label}: {e.seconds}s. Cooldown {cooldown}s.")
                     await update_progress(
                         current_item=identifier,
@@ -1037,11 +1072,13 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                     total_stats['deleted'] += 1
                     account_state[account_id]['deleted'] += 1
                     await handle_banned_account(client_data, e, admin_chat_id)
+                    record_account_runtime_event(account_id, "join", False, last_error=type(e).__name__)
                     logging.warning(f"Bulk channels: removed inactive account {label}: {type(e).__name__}")
                     return False, True
                 except (InviteHashExpiredError, InviteHashInvalidError, ValueError, ChannelPrivateError, RPCError) as e:
                     total_stats['failed'] += 1
                     account_state[account_id]['failed'] += 1
+                    record_account_runtime_event(account_id, "join", False, last_error=f"{type(e).__name__}: {e}")
                     await mark_attempt(account_id, f"failed join {type(e).__name__}")
                     logging.warning(f"Bulk channels: account {label} failed to join '{identifier}': {type(e).__name__} - {e}")
                     await asyncio.sleep(random.uniform(attempt_gap_min, attempt_gap_max))
@@ -1049,6 +1086,7 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                 except Exception as e:
                     total_stats['failed'] += 1
                     account_state[account_id]['failed'] += 1
+                    record_account_runtime_event(account_id, "join", False, last_error=f"{type(e).__name__}: {e}")
                     await mark_attempt(account_id, "unexpected failure")
                     logging.warning(f"Bulk channels: account {label} unexpected join error for '{identifier}': {type(e).__name__} - {e}")
                     await asyncio.sleep(random.uniform(attempt_gap_min, attempt_gap_max))

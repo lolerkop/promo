@@ -31,7 +31,7 @@ from db import (add_analytics_log, get_account_details,
                 get_active_category_prompt_for_chat, get_category_keywords,
                 get_config_value, get_current_workspace_id, get_db_connection,
                 get_entity_assigned_account_id, get_workspace_session_dir,
-                list_workspaces, reset_workspace_context,
+                list_workspaces, record_account_runtime_event, reset_workspace_context,
                 refresh_expired_proxies, set_config_value,
                 set_workspace_context, update_all_tables)
 
@@ -763,6 +763,7 @@ async def auto_comment_on_new_topic_handler(event, client_obj, client_data):
 								details=success_details,
 								success=True
 						)
+						record_account_runtime_event(success_account_id, "auto_comment", True)
 						logging.info(
 								f"AUTO_COMMENT_HANDLER: post {post_key} commented by {success_account_label} (ID: {success_account_id}).")
 						try:
@@ -787,6 +788,13 @@ async def auto_comment_on_new_topic_handler(event, client_obj, client_data):
 								details=f"Channel: {event.chat_id}, Errors: {len(attempt_errors)}",
 								success=False
 						)
+						if coordinator_account_id:
+								record_account_runtime_event(
+										coordinator_account_id,
+										"auto_comment",
+										False,
+										last_error=error_text_report[:500]
+								)
 
 		except Exception as e_outer:
 				logging.error(

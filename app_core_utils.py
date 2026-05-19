@@ -7,7 +7,8 @@ from telethon import TelegramClient
 from telethon.tl.types import Channel
 
 # Импорты из вашего проекта
-from db import get_config_value, add_analytics_log, get_db_connection
+from db import (add_analytics_log, get_config_value, get_db_connection,
+                record_account_runtime_event)
 from userbot import get_next_account_in_cycle, generate_vpn_comment
 
 
@@ -90,6 +91,7 @@ async def send_regular_comment_now_core(initiated_by_admin: bool = True, last_us
         try:
             await client.send_message(chat_id, generated_text_base, parse_mode='html', link_preview=False)
             last_usage_times_param[account_key] = time.time()
+            record_account_runtime_event(report["account_id"], "regular_comment", True)
             logging.info(f"[send_regular_comment_now_core] Аккаунт {account_key} => Чат '{chat_title}' ({chat_id})")
             report["sent_to"].append({"chat_id": chat_id, "title": chat_title})
             await asyncio.sleep(random.randint(2, 5))
@@ -97,6 +99,7 @@ async def send_regular_comment_now_core(initiated_by_admin: bool = True, last_us
             error_message = str(e)
             logging.error(
                 f"[send_regular_comment_now_core] Ошибка в чате '{chat_title}' ({chat_id}) аккаунтом {account_key}: {error_message}")
+            record_account_runtime_event(report["account_id"], "regular_comment", False, last_error=error_message[:500])
             report["failed_for"].append({"chat_id": chat_id, "title": chat_title, "error": error_message})
             if "FloodWait" in error_message:
                 try:

@@ -43,6 +43,9 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="\U0001F4CC \u0423\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435 \u0437\u0430\u0434\u0430\u0447\u0430\u043c\u0438", callback_data="manage_tasks")
+        ],
+        [
+            InlineKeyboardButton(text="\U0001FA7A \u0421\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u0435 \u0438 \u043e\u0431\u0441\u043b\u0443\u0436\u0438\u0432\u0430\u043d\u0438\u0435", callback_data="maintenance_menu")
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
