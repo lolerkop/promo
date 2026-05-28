@@ -104,6 +104,145 @@ def _pick_api_credentials_for_new_account() -> dict | None:
     return get_available_api_credential()
 
 
+def _safe_session_label(source_name: str) -> str:
+    base_name = os.path.splitext(os.path.basename(source_name or ""))[0].strip()
+    safe = "".join(ch if (ch.isalnum() or ch in ("_", "-")) else "_" for ch in base_name)
+    return (safe or f"session_{int(time.time())}")[:64]
+
+
+def _session_label_exists(label: str) -> bool:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT 1 FROM accounts WHERE session_name = ? LIMIT 1", (label,))
+        if cursor.fetchone():
+            return True
+    finally:
+        conn.close()
+    return os.path.exists(os.path.join(get_workspace_session_dir(), f"{label}.session"))
+
+
+def _unique_session_label(source_name: str) -> str:
+    base_label = _safe_session_label(source_name)
+    label = base_label
+    suffix = 2
+    while _session_label_exists(label):
+        label = f"{base_label}_{suffix}"
+        suffix += 1
+    return label
+
+
+def _find_existing_account_by_user_id(user_id: int) -> dict | None:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT id, session_name, label FROM accounts WHERE user_id = ? LIMIT 1", (user_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _proxy_payload_from_row(proxy_row: dict | None) -> tuple[dict | None, dict]:
+    if not proxy_row:
+        return None, {
+            "proxy_id": None,
+            "proxy_type": None,
+            "proxy_ip": None,
+            "proxy_port": None,
+            "proxy_username": None,
+            "proxy_password": None,
+        }
+
+    runtime_proxy = {
+        "proxy_type": proxy_row["proxy_type"],
+        "addr": proxy_row["proxy_ip"],
+        "port": proxy_row["proxy_port"],
+        "username": proxy_row.get("proxy_username"),
+        "password": proxy_row.get("proxy_password"),
+    }
+    fsm_proxy = {
+        "proxy_id": proxy_row["id"],
+        "proxy_type": proxy_row["proxy_type"],
+        "proxy_ip": proxy_row["proxy_ip"],
+        "proxy_port": proxy_row["proxy_port"],
+        "proxy_username": proxy_row.get("proxy_username"),
+        "proxy_password": proxy_row.get("proxy_password"),
+    }
+    return runtime_proxy, fsm_proxy
+
+
+async def _import_telethon_session_file(
+        source_session_path: str,
+        source_name: str,
+        message: Message,
+        state: FSMContext,
+        json_data: dict | None = None
+) -> tuple[bool, str]:
+    json_data = json_data or {}
+    credential = _pick_api_credentials_for_new_account()
+    if credential:
+        api_id = int(credential["api_id"])
+        api_hash = credential["api_hash"]
+    else:
+        api_id = json_data.get("app_id") or json_data.get("api_id")
+        api_hash = json_data.get("app_hash") or json_data.get("api_hash")
+
+    if not api_id or not api_hash:
+        return False, "нет свободной API-пары и нет app_id/app_hash в JSON"
+
+    label = _unique_session_label(source_name)
+    final_session_path = os.path.join(get_workspace_session_dir(), f"{label}.session")
+    free_proxy = get_unassigned_proxy()
+    runtime_proxy, fsm_proxy = _proxy_payload_from_row(free_proxy)
+    client = None
+
+    try:
+        shutil.copy(source_session_path, final_session_path)
+        client = TelegramClient(SQLiteSession(final_session_path), int(api_id), api_hash, proxy=runtime_proxy)
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            if client.is_connected():
+                await client.disconnect()
+            try:
+                os.remove(final_session_path)
+            except OSError:
+                pass
+            return False, "сессия не авторизована"
+
+        me = await client.get_me()
+        existing = _find_existing_account_by_user_id(me.id)
+        if existing:
+            if client.is_connected():
+                await client.disconnect()
+            try:
+                os.remove(final_session_path)
+            except OSError:
+                pass
+            return False, f"аккаунт уже есть в базе: ID {existing['id']} ({existing['session_name']})"
+
+        phone = json_data.get("phone") or getattr(me, "phone", None) or f"uid_{me.id}"
+        fsm_data = {
+            "phone": phone,
+            "api_id": int(api_id),
+            "api_hash": api_hash,
+            "label": label,
+            **fsm_proxy,
+        }
+        await finalize_account_add(client, fsm_data, message, state)
+        return True, f"{label} / UID {me.id}"
+    except Exception as e:
+        if client and client.is_connected():
+            await client.disconnect()
+        try:
+            if os.path.exists(final_session_path):
+                os.remove(final_session_path)
+        except OSError:
+            pass
+        return False, f"{type(e).__name__}: {e}"
+
+
 @dp.callback_query(F.data == "account_settings")
 async def cb_account_settings(callback: CallbackQuery, state: FSMContext):
     if not user_is_allowed(callback.from_user.id):
@@ -111,6 +250,7 @@ async def cb_account_settings(callback: CallbackQuery, state: FSMContext):
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗂️ Сканировать и импортировать сессии", callback_data="account_scan_and_import")],
+        [InlineKeyboardButton(text="📥 Загрузить .session Telethon", callback_data="account_import_telethon_session")],
         [InlineKeyboardButton(text="➕ Добавить по номеру телефона", callback_data="account_add")],
         [InlineKeyboardButton(text="🔑 API ID/HASH", callback_data="api_credentials_menu")],
         [InlineKeyboardButton(text="🗂️ Массовое добавление прокси", callback_data="bulk_add_proxies_start")],
@@ -255,6 +395,61 @@ async def cb_api_credential_ignore(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "account_import_telethon_session")
+async def cb_import_telethon_session(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "Загрузите файл <code>.session</code> от Telethon. "
+        "Бот возьмет свободную API-пару из текущего пространства и проверит сессию.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="account_settings")]]
+        )
+    )
+    await state.set_state(AccountAdditionStates.WaitingForTelethonSessionFile)
+    await callback.answer()
+
+
+@dp.message(AccountAdditionStates.WaitingForTelethonSessionFile, F.document)
+async def handle_telethon_session_upload(message: Message, state: FSMContext):
+    if not user_is_allowed(message.from_user.id):
+        return
+    document_name = message.document.file_name or ""
+    if not document_name.endswith(".session"):
+        await message.answer("Нужен файл Telethon с расширением .session.")
+        return
+
+    temp_dir = os.path.join("sessions_import", "uploads")
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_path = os.path.join(temp_dir, f"upload_{message.from_user.id}_{int(time.time())}.session")
+    await bot.download(message.document.file_id, destination=temp_path)
+    await message.answer(f"Проверяю сессию <code>{html.escape(document_name)}</code>...")
+
+    try:
+        ok, details = await _import_telethon_session_file(temp_path, document_name, message, state)
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
+    if ok:
+        await message.answer(f"Импорт .session завершен: {html.escape(details)}", reply_markup=main_menu_keyboard())
+    else:
+        await message.answer(f"Не удалось импортировать .session: {html.escape(details)}", reply_markup=main_menu_keyboard())
+    await state.clear()
+
+
+@dp.message(AccountAdditionStates.WaitingForTelethonSessionFile)
+async def handle_telethon_session_upload_wrong(message: Message, state: FSMContext):
+    if not user_is_allowed(message.from_user.id):
+        return
+    await message.answer("Ожидается документ .session или нажмите отмену.")
+
+
 @dp.callback_query(F.data == "account_scan_and_import")
 async def cb_scan_and_import_sessions(callback: CallbackQuery, state: FSMContext):
     if not user_is_allowed(callback.from_user.id):
@@ -271,15 +466,21 @@ async def cb_scan_and_import_sessions(callback: CallbackQuery, state: FSMContext
     os.makedirs(SESSIONS_ARCHIVE_DIR, exist_ok=True)
 
     try:
-        json_files = [f for f in os.listdir(SESSIONS_IMPORT_DIR) if f.endswith('.json')]
+        import_files = os.listdir(SESSIONS_IMPORT_DIR)
+        json_files = [f for f in import_files if f.endswith('.json')]
+        paired_session_files = {f.replace('.json', '.session') for f in json_files}
+        session_only_files = [
+            f for f in import_files
+            if f.endswith('.session') and f not in paired_session_files
+        ]
     except FileNotFoundError:
         await bot.send_message(callback.from_user.id,
                                "⚠️ Папка `sessions_import` не найдена. Создайте ее и поместите файлы.")
         return
 
-    if not json_files:
+    if not json_files and not session_only_files:
         await bot.send_message(callback.from_user.id,
-                               "ℹ️ Новых `.json` файлов для импорта в папке `sessions_import` не найдено.")
+                               "ℹ️ Новых `.json` или `.session` файлов для импорта в папке `sessions_import` не найдено.")
         return
 
     conn_check = get_db_connection()
@@ -405,6 +606,26 @@ async def cb_scan_and_import_sessions(callback: CallbackQuery, state: FSMContext
             error_count += 1
             if client and client.is_connected():
                 await client.disconnect()
+
+    for session_filename in session_only_files:
+        session_path = os.path.join(SESSIONS_IMPORT_DIR, session_filename)
+        await bot.send_message(callback.from_user.id, f"▶️ Импортирую Telethon .session: <code>{html.escape(session_filename)}</code>")
+        ok, details = await _import_telethon_session_file(session_path, session_filename, callback.message, state)
+        if ok:
+            success_count += 1
+            try:
+                shutil.move(session_path, os.path.join(SESSIONS_ARCHIVE_DIR, session_filename))
+            except Exception as e_move:
+                logger.warning(f"Could not archive imported session {session_filename}: {e_move}")
+        elif "аккаунт уже есть" in details:
+            skipped_count += 1
+            try:
+                shutil.move(session_path, os.path.join(SESSIONS_ARCHIVE_DIR, session_filename))
+            except Exception as e_move:
+                logger.warning(f"Could not archive skipped session {session_filename}: {e_move}")
+        else:
+            error_count += 1
+        await bot.send_message(callback.from_user.id, f"{'✅' if ok else '⚠️'} {html.escape(session_filename)}: {html.escape(details)}")
 
     summary_message = f"🏁 Сканирование завершено!\n\n" \
                       f"✅ Успешно импортировано: {success_count}\n" \

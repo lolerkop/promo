@@ -44,6 +44,7 @@ class AccountAdditionStates(StatesGroup):
 	WaitingForTDataApiHash = State()
 	WaitingForTDataConfirmation = State()
 	WaitingForProxyFile = State()
+	WaitingForTelethonSessionFile = State()
 
 
 class AccountSettingsStates(StatesGroup):
