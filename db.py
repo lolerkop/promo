@@ -19,6 +19,7 @@ DEFAULT_WORKSPACE_ID = "default"
 DB_MIGRATIONS = (
 	(1, "runtime_indexes"),
 	(2, "openai_only_provider"),
+	(3, "account_entity_memberships"),
 )
 _current_workspace_id = contextvars.ContextVar("current_workspace_id", default=None)
 
@@ -395,6 +396,20 @@ def create_tables():
 	""")
 
 	c.execute("""
+	CREATE TABLE IF NOT EXISTS account_entity_memberships (
+		account_id INTEGER NOT NULL,
+		entity_type TEXT NOT NULL CHECK(entity_type IN ('channel', 'group')),
+		entity_id INTEGER NOT NULL,
+		identifier TEXT,
+		status TEXT DEFAULT 'active',
+		joined_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		PRIMARY KEY (account_id, entity_type, entity_id),
+		FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+	)
+	""")
+
+	c.execute("""
 	CREATE TABLE IF NOT EXISTS category_keywords (
 		category_name TEXT NOT NULL,
 		keyword TEXT NOT NULL,
@@ -488,10 +503,59 @@ def _migration_openai_only_provider(cursor):
 	cursor.execute("DELETE FROM config WHERE key = ?", ("g4f_model",))
 
 
+def _migration_account_entity_memberships(cursor):
+	now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+	cursor.execute("""
+		CREATE TABLE IF NOT EXISTS account_entity_memberships (
+			account_id INTEGER NOT NULL,
+			entity_type TEXT NOT NULL CHECK(entity_type IN ('channel', 'group')),
+			entity_id INTEGER NOT NULL,
+			identifier TEXT,
+			status TEXT DEFAULT 'active',
+			joined_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (account_id, entity_type, entity_id),
+			FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+		)
+	""")
+	cursor.execute("""
+		INSERT OR IGNORE INTO account_entity_memberships (
+			account_id, entity_type, entity_id, identifier, status, joined_at, updated_at
+		)
+		SELECT assigned_account_id, 'channel', id, COALESCE(username, CAST(id AS TEXT)), 'active', ?, ?
+		FROM channels
+		WHERE assigned_account_id IS NOT NULL
+	""", (now, now))
+	cursor.execute("""
+		INSERT OR IGNORE INTO account_entity_memberships (
+			account_id, entity_type, entity_id, identifier, status, joined_at, updated_at
+		)
+		SELECT assigned_account_id, 'group', id, COALESCE(username, CAST(id AS TEXT)), 'active', ?, ?
+		FROM groups
+		WHERE assigned_account_id IS NOT NULL
+	""", (now, now))
+	cursor.execute("""
+		INSERT OR IGNORE INTO account_entity_memberships (
+			account_id, entity_type, entity_id, identifier, status, joined_at, updated_at
+		)
+		SELECT account_db_id, 'group', chat_id, chat_link, 'active', ?, ?
+		FROM category_joined_chats
+	""", (now, now))
+	cursor.execute(
+		"CREATE INDEX IF NOT EXISTS idx_entity_memberships_account_status "
+		"ON account_entity_memberships(account_id, status)"
+	)
+	cursor.execute(
+		"CREATE INDEX IF NOT EXISTS idx_entity_memberships_entity "
+		"ON account_entity_memberships(entity_type, entity_id, status)"
+	)
+
+
 def run_migrations():
 	migration_handlers = {
 		1: _migration_runtime_indexes,
 		2: _migration_openai_only_provider,
+		3: _migration_account_entity_memberships,
 	}
 	conn = get_db_connection()
 	c = conn.cursor()
@@ -537,6 +601,21 @@ def update_all_tables():
 	_add_column_if_not_exists("proxies", "last_checked_at", "TEXT")
 	_add_column_if_not_exists("proxies", "last_error", "TEXT")
 	run_migrations()
+
+
+def record_entity_memberships(account_ids: list[int], entity_type: str, entity_id: int, identifier: str = None):
+	from services.subscription_repository import record_entity_memberships as _impl
+	return _impl(account_ids, entity_type, entity_id, identifier)
+
+
+def mark_entity_memberships_left(entity_type: str, entity_ids: list[int], account_ids: list[int] = None):
+	from services.subscription_repository import mark_entity_memberships_left as _impl
+	return _impl(entity_type, entity_ids, account_ids)
+
+
+def get_account_subscription_loads() -> dict[int, int]:
+	from services.subscription_repository import get_account_subscription_loads as _impl
+	return _impl()
 
 
 def set_config_value(key: str, value: str):
@@ -935,6 +1014,7 @@ async def remove_telethon_account(acc_id: int) -> str:
 
 	c.execute("DELETE FROM accounts WHERE id=?", (acc_id,))
 	c.execute("DELETE FROM category_joined_chats WHERE account_db_id=?", (acc_id,))
+	c.execute("DELETE FROM account_entity_memberships WHERE account_id=?", (acc_id,))
 	c.execute("DELETE FROM sessions WHERE session_id=?", (session_name,))
 	conn.commit()
 	conn.close()

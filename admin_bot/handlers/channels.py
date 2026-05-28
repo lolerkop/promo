@@ -21,7 +21,7 @@ from ..utils import (
 )
 from ..keyboards import build_channels_keyboard, cancel_action_keyboard, main_menu_keyboard
 from ..states import ChannelManagementStates
-from db import get_db_connection
+from db import get_db_connection, record_entity_memberships
 
 CHANNELS_LIST_TITLE = "\U0001F4DC <b>\u0421\u043f\u0438\u0441\u043e\u043a \u043a\u0430\u043d\u0430\u043b\u043e\u0432</b>:"
 
@@ -137,6 +137,12 @@ async def handle_channel_identifier(message: Message, state: FSMContext):
         )
         conn.commit()
         conn.close()
+        record_entity_memberships(
+            channel_subs_stats.get('joined_account_ids', []),
+            'channel',
+            channel_info["id"],
+            channel_identifier
+        )
         await message.answer(
             f"Channel '{html.escape(entity_title_display)}' (ID: {channel_info['id']}) added to database.")
         asyncio.create_task(

@@ -15,7 +15,8 @@ from ..bot_instance import dp, bot
 from ..utils import user_is_allowed, get_entity_info_robust, subscribe_entity_logic
 from db import (
     get_db_connection,
-    add_category_keyword, delete_category_keyword, get_category_keywords
+    add_category_keyword, delete_category_keyword, get_category_keywords,
+    record_entity_memberships, mark_entity_memberships_left
 )
 from userbot import get_active_clients
 from ..states import CategoryRegularCommentStates
@@ -488,6 +489,12 @@ async def _task_process_category_activation(category_name: str, admin_chat_id: i
                     (category_name, group_info["id"], assigned_id or group_info['client_data']['id'], chat_link)
                 )
                 conn.commit()
+                record_entity_memberships(
+                    stats.get('joined_account_ids') or [assigned_id or group_info['client_data']['id']],
+                    'group',
+                    group_info["id"],
+                    chat_link
+                )
                 total_stats['db_added'] += 1
 
         except asyncio.CancelledError:
@@ -560,6 +567,11 @@ async def _task_process_category_deactivation(category_name: str, admin_chat_id:
                 await bot.send_message(admin_chat_id,
                                        f"⚠️ Не найден активный/подключенный клиент для аккаунта ID {account_db_id_to_use} для отписки от {chat_link_display}.")
 
+    mark_entity_memberships_left(
+        'group',
+        [entry["chat_id"] for entry in chats_to_leave],
+        [entry["account_db_id"] for entry in chats_to_leave]
+    )
     c.execute("DELETE FROM category_joined_chats WHERE category_name = ?", (category_name,))
     conn.commit()
     conn.close()

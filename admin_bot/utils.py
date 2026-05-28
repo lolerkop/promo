@@ -26,7 +26,8 @@ from telethon.utils import get_peer_id
 from shared import active_background_tasks
 from db import get_db_connection, get_config_value, add_analytics_log, set_entity_assigned_account, \
     get_active_workspace_id, get_current_workspace_id, record_account_runtime_event, \
-    remove_telethon_account, run_in_workspace, set_account_runtime_cooldown
+    remove_telethon_account, run_in_workspace, set_account_runtime_cooldown, \
+    record_entity_memberships, mark_entity_memberships_left, get_account_subscription_loads
 from userbot import generate_vpn_comment, get_next_account_in_cycle, get_active_clients
 
 from .bot_instance import bot, allowed_ids, TEMP_PHOTO_DIR
@@ -426,36 +427,28 @@ def _get_subscription_accounts_per_entity() -> int:
     return _get_int_config_value("subscription_accounts_per_entity", 5, 1)
 
 
-def _get_account_subscription_loads() -> dict[int, int]:
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    loads: dict[int, int] = {}
-    try:
-        cursor.execute("""
-            SELECT account_id, SUM(cnt) AS total_count
-            FROM (
-                SELECT assigned_account_id AS account_id, COUNT(*) AS cnt
-                FROM channels
-                WHERE assigned_account_id IS NOT NULL
-                GROUP BY assigned_account_id
-                UNION ALL
-                SELECT assigned_account_id AS account_id, COUNT(*) AS cnt
-                FROM groups
-                WHERE assigned_account_id IS NOT NULL
-                GROUP BY assigned_account_id
-            )
-            GROUP BY account_id
-        """)
-        loads = {int(row["account_id"]): int(row["total_count"] or 0) for row in cursor.fetchall()}
-    except Exception as e:
-        logging.warning(f"Could not load account subscription balance: {e}")
-    finally:
-        conn.close()
-    return loads
+def _subscription_stats() -> dict:
+    return {'success': 0, 'failed': 0, 'deleted': 0, 'joined_account_ids': []}
+
+
+def _mark_join_success(stats: dict, account_id: int):
+    stats['success'] += 1
+    joined_account_ids = stats.setdefault('joined_account_ids', [])
+    if account_id is not None and account_id not in joined_account_ids:
+        joined_account_ids.append(account_id)
+
+
+def _membership_entity_type_from_label(entity_type: str) -> str | None:
+    value = (entity_type or "").lower()
+    if "channel" in value or "канал" in value:
+        return "channel"
+    if "group" in value or "груп" in value or "чат" in value:
+        return "group"
+    return None
 
 
 def _order_clients_for_balanced_subscription(clients_pool: list[tuple[TelegramClient, dict]], runtime_loads: dict[int, int] | None = None):
-    db_loads = _get_account_subscription_loads()
+    db_loads = get_account_subscription_loads()
     runtime_loads = runtime_loads or {}
     return sorted(
         clients_pool,
@@ -520,6 +513,8 @@ async def remove_group_from_db_and_leave(group_id: int) -> str:
     else:
         logging.info("Нет активных клиентских аккаунтов для выполнения отписки.")
 
+    mark_entity_memberships_left("group", [group_id])
+
     if not errors_leaving:
         return f"Группа {group_display_name} (ID={group_id}) удалена из БД и все аккаунты успешно отписались."
     else:
@@ -575,6 +570,10 @@ async def mass_leave_entities_for_all_clients(admin_chat_id: int, entity_ids: li
 
         await asyncio.sleep(random.uniform(1, 3))
 
+    membership_type = _membership_entity_type_from_label(entity_type)
+    if membership_type:
+        mark_entity_memberships_left(membership_type, entity_ids)
+
     summary_message = (
         f"🏁 Завершена массовая отписка от {total_entities} {entity_type}.\n\n"
         f"Всего успешных отписок аккаунтов от {entity_type}: {global_success_leaves}\n"
@@ -584,7 +583,7 @@ async def mass_leave_entities_for_all_clients(admin_chat_id: int, entity_ids: li
 
 
 async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_id: int):
-    stats = {'success': 0, 'failed': 0, 'deleted': 0}
+    stats = _subscription_stats()
     assigned_account_id = None
     subscription_mode = get_config_value("subscription_mode", "all_accounts")
 
@@ -607,7 +606,7 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
 
             try:
                 await join_group_with_client(client, identifier)
-                stats['success'] += 1
+                _mark_join_success(stats, account_id)
                 assigned_account_id = account_id
                 record_account_runtime_event(account_id, "join", True)
                 logging.info(f"Аккаунт '{label}' успешно подписался на '{identifier}' и был назначен.")
@@ -628,7 +627,7 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
                 break
 
             except UserAlreadyParticipantError:
-                stats['success'] += 1
+                _mark_join_success(stats, account_id)
                 assigned_account_id = account_id
                 record_account_runtime_event(account_id, "join", True)
                 logging.info(f"Аккаунт '{label}' уже в чате '{identifier}' и был назначен.")
@@ -652,7 +651,7 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
             account_id = client_data.get("id")
             try:
                 await join_group_with_client(client, identifier)
-                stats['success'] += 1
+                _mark_join_success(stats, account_id)
                 record_account_runtime_event(account_id, "join", True)
                 runtime_loads[account_id] = runtime_loads.get(account_id, 0) + 1
                 runtime_key = _subscription_runtime_key(account_id)
@@ -667,7 +666,7 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
                 record_account_runtime_event(account_id, "join", False, last_error=type(e).__name__)
 
             except UserAlreadyParticipantError:
-                stats['success'] += 1
+                _mark_join_success(stats, account_id)
                 record_account_runtime_event(account_id, "join", True)
                 runtime_loads[account_id] = runtime_loads.get(account_id, 0) + 1
                 runtime_key = _subscription_runtime_key(account_id)
@@ -688,7 +687,7 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
             account_id = client_data.get("id")
             try:
                 await join_group_with_client(client, identifier)
-                stats['success'] += 1
+                _mark_join_success(stats, account_id)
                 record_account_runtime_event(account_id, "join", True)
 
             except FATAL_ACCOUNT_ERRORS as e:
@@ -698,7 +697,7 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
                 record_account_runtime_event(account_id, "join", False, last_error=type(e).__name__)
 
             except UserAlreadyParticipantError:
-                stats['success'] += 1
+                _mark_join_success(stats, account_id)
                 record_account_runtime_event(account_id, "join", True)
 
             except Exception as e:
@@ -785,6 +784,12 @@ async def subscribe_groups_bulk_in_bg(admin_chat_id: int, admin_user_id: int, li
                             )
                             conn_db.commit()
                             conn_db.close()
+                            record_entity_memberships(
+                                stats.get('joined_account_ids', []),
+                                'group',
+                                group_info["id"],
+                                link_str
+                            )
                             total_stats['db_added'] += 1
                             asyncio.create_task(
                                 send_ai_welcome_message_to_chat(
@@ -984,7 +989,12 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                         force=True
                     )
 
-            async def add_channel_to_db(identifier: str, assigned_id: int | None, info_client: TelegramClient):
+            async def add_channel_to_db(
+                    identifier: str,
+                    assigned_id: int | None,
+                    info_client: TelegramClient,
+                    joined_account_ids: list[int]
+            ):
                 try:
                     try:
                         entity = await info_client.get_entity(_coerce_entity_identifier(identifier))
@@ -1006,6 +1016,7 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                     )
                     conn_db.commit()
                     conn_db.close()
+                    record_entity_memberships(joined_account_ids, 'channel', channel_info["id"], identifier)
                     total_stats['db_added'] += 1
 
                     channel_title_display = channel_info.get('title') or channel_info.get('username') or identifier
@@ -1112,6 +1123,7 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                     joined_by_any = False
                     assigned_id = None
                     info_client = None
+                    joined_account_ids_for_entity = []
 
                     if subscription_mode == "single_account_sticky":
                         attempts_left = len(clients_pool)
@@ -1125,6 +1137,7 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                                 joined_by_any = True
                                 assigned_id = client_data.get('id')
                                 info_client = client
+                                joined_account_ids_for_entity.append(client_data.get('id'))
                             elif retry_later:
                                 continue
                     elif subscription_mode == "one_entity_five_accounts":
@@ -1147,6 +1160,7 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                                 success_count_for_entity += 1
                                 joined_by_any = True
                                 info_client = info_client or client
+                                joined_account_ids_for_entity.append(account_id)
                                 if assigned_id is None:
                                     assigned_id = account_id
                     else:
@@ -1159,9 +1173,10 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                             if ok:
                                 joined_by_any = True
                                 info_client = info_client or client
+                                joined_account_ids_for_entity.append(account_id)
 
                     if joined_by_any:
-                        await add_channel_to_db(ident_str, assigned_id, info_client)
+                        await add_channel_to_db(ident_str, assigned_id, info_client, joined_account_ids_for_entity)
                         await update_progress(
                             current_item=ident_str,
                             status="Joined and saved to database.",
@@ -1575,6 +1590,12 @@ async def auto_handle_linked_chat_and_add_to_groups(admin_chat_id: int, main_cha
              assigned_account_id)
         )
         conn.commit()
+        record_entity_memberships(
+            stats.get('joined_account_ids', []),
+            'group',
+            linked_chat_info_dict["id"],
+            identifier_for_join_call
+        )
         logging.info(
             f"Связанная группа {linked_chat_display_name} (ID: {linked_chat_info_dict['id']}) добавлена/обновлена в таблице 'groups'.")
         await send_ai_welcome_message_to_chat(

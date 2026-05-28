@@ -17,7 +17,7 @@ from ..utils import (
 )
 from ..keyboards import build_groups_keyboard, cancel_action_keyboard, main_menu_keyboard
 from ..states import GroupManagementStates
-from db import get_db_connection
+from db import get_db_connection, record_entity_memberships
 
 GROUPS_LIST_TITLE = "\U0001F4DC <b>\u0421\u043f\u0438\u0441\u043e\u043a \u0433\u0440\u0443\u043f\u043f</b>:"
 
@@ -98,6 +98,12 @@ async def handle_add_group(message: Message, state: FSMContext):
             (group_info["id"], group_info.get("username"), group_info.get("title"), assigned_id))
         conn.commit()
         conn.close()
+        record_entity_memberships(
+            stats.get('joined_account_ids', []),
+            'group',
+            group_info["id"],
+            group_identifier
+        )
 
     final_report = (
         f"<b>🏁 Итоговый отчет по добавлению '{html.escape(entity_title_display)}':</b>\n\n"
