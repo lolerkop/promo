@@ -13,7 +13,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 from ..bot_instance import dp, bot
 from ..keyboards import cancel_action_keyboard
-from ..prompt_files import read_prompt_document
+from ..prompt_files import read_prompt_document, send_prompt_preview_file
 from ..utils import user_is_allowed, get_entity_info_robust, subscribe_entity_logic
 from db import (
     get_db_connection,
@@ -31,6 +31,36 @@ PROMPT_INPUT_HINT = (
     "\u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c .txt \u0444\u0430\u0439\u043b \u0441 \u043f\u043e\u043b\u043d\u044b\u043c \u043f\u0440\u043e\u043c\u043f\u0442\u043e\u043c. "
     "\u0414\u043b\u044f \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u044f \u043f\u0440\u043e\u043c\u043f\u0442\u0430 \u043e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 '-'."
 )
+
+
+async def show_category_prompt_editor(
+    callback: CallbackQuery,
+    state: FSMContext,
+    category_name: str,
+    title: str,
+    current_prompt: str,
+    target_state,
+    filename: str,
+) -> None:
+    prompt = current_prompt or ""
+    status = "\u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d .txt \u0444\u0430\u0439\u043b\u043e\u043c \u043d\u0438\u0436\u0435" if prompt.strip() else "\u043d\u0435 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d"
+    await callback.message.edit_text(
+        f"<b>\u041a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u044f: {html.escape(category_name)}</b>\n"
+        f"<b>{html.escape(title)}</b>\n"
+        f"\u0422\u0435\u043a\u0443\u0449\u0430\u044f \u0434\u043b\u0438\u043d\u0430: <b>{len(prompt)}</b> \u0441\u0438\u043c\u0432.\n"
+        f"\u0422\u0435\u043a\u0443\u0449\u0438\u0439 \u043f\u0440\u043e\u043c\u043f\u0442: {status}.\n\n"
+        f"{PROMPT_INPUT_HINT}",
+        parse_mode="HTML",
+        reply_markup=cancel_action_keyboard()
+    )
+    await send_prompt_preview_file(
+        callback.message,
+        prompt,
+        filename,
+        f"\u0422\u0435\u043a\u0443\u0449\u0438\u0439 \u043f\u0440\u043e\u043c\u043f\u0442: {title} ({category_name})"
+    )
+    await state.set_state(target_state)
+    await callback.answer()
 
 
 class CategorySettingsStates(StatesGroup):
@@ -272,15 +302,15 @@ async def cb_set_cat_rc_prompt(callback: CallbackQuery, state: FSMContext):
     category_name = callback.data.split(":")[1]
     await state.update_data(current_category_name=category_name)
     current_prompt = get_category_status(category_name).get('regular_comment_prompt', "")
-    await callback.message.edit_text(
-        f"<b>Категория: {category_name}</b>\n"
-        f"Текущий промпт авто-комментария:\n<pre>{html.escape(current_prompt) if current_prompt else 'Не установлен'}</pre>\n\n"
-        f"{PROMPT_INPUT_HINT}",
-        parse_mode="HTML",
-        reply_markup=cancel_action_keyboard()
+    await show_category_prompt_editor(
+        callback,
+        state,
+        category_name,
+        "\u041f\u0440\u043e\u043c\u043f\u0442 \u0430\u0432\u0442\u043e-\u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u044f",
+        current_prompt,
+        CategoryRegularCommentStates.WaitingForPrompt,
+        f"category_{category_name}_regular_comment_prompt.txt",
     )
-    await state.set_state(CategoryRegularCommentStates.WaitingForPrompt)
-    await callback.answer()
 
 
 @dp.message(CategoryRegularCommentStates.WaitingForPrompt, F.text, ~F.text.startswith('/'))
@@ -312,15 +342,15 @@ async def cb_set_category_prompt(callback: CallbackQuery, state: FSMContext):
     await state.update_data(current_category_name=category_name)
 
     current_prompt = get_category_status(category_name).get("prompt", "")
-    await callback.message.edit_text(
-        f"<b>Категория: {category_name}</b>\n"
-        f"Текущий промпт (для триггеров):\n<pre>{html.escape(current_prompt) if current_prompt else 'Не установлен'}</pre>\n\n"
-        f"{PROMPT_INPUT_HINT}",
-        parse_mode="HTML",
-        reply_markup=cancel_action_keyboard()
+    await show_category_prompt_editor(
+        callback,
+        state,
+        category_name,
+        "\u041f\u0440\u043e\u043c\u043f\u0442 \u0434\u043b\u044f \u0442\u0440\u0438\u0433\u0433\u0435\u0440\u043e\u0432",
+        current_prompt,
+        CategorySettingsStates.WaitingForCategoryPrompt,
+        f"category_{category_name}_trigger_prompt.txt",
     )
-    await state.set_state(CategorySettingsStates.WaitingForCategoryPrompt)
-    await callback.answer()
 
 
 @dp.message(CategorySettingsStates.WaitingForCategoryPrompt, F.text, ~F.text.startswith('/'))

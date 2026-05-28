@@ -17,7 +17,7 @@ from ..bot_instance import (DEFAULT_AI_BASE_PROMPT, DEFAULT_AI_MAX_TOKENS,
                             DEFAULT_AI_TEMPERATURE, DEFAULT_OPENAI_MODEL, bot,
                             dp)
 from ..keyboards import cancel_action_keyboard, main_menu_keyboard
-from ..prompt_files import read_prompt_document
+from ..prompt_files import read_prompt_document, send_prompt_preview_file
 from ..states import AIConfigStates
 from ..utils import user_is_allowed
 from services.prompt_text import PromptTextError
@@ -43,6 +43,34 @@ PROMPT_INPUT_HINT = (
 	"\u041c\u043e\u0436\u043d\u043e \u0432\u0432\u0435\u0441\u0442\u0438 \u0442\u0435\u043a\u0441\u0442 \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435\u043c "
 	"\u0438\u043b\u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c .txt \u0444\u0430\u0439\u043b \u0441 \u043f\u043e\u043b\u043d\u044b\u043c \u043f\u0440\u043e\u043c\u043f\u0442\u043e\u043c."
 )
+
+
+async def show_ai_prompt_editor(
+	callback: CallbackQuery,
+	state: FSMContext,
+	title: str,
+	current_prompt: str,
+	target_state,
+	filename: str,
+) -> None:
+	prompt = current_prompt or ""
+	status = "\u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d .txt \u0444\u0430\u0439\u043b\u043e\u043c \u043d\u0438\u0436\u0435" if prompt.strip() else "\u043d\u0435 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d"
+	await callback.message.edit_text(
+		f"<b>{html.escape(title)}</b>\n"
+		f"\u0422\u0435\u043a\u0443\u0449\u0430\u044f \u0434\u043b\u0438\u043d\u0430: <b>{len(prompt)}</b> \u0441\u0438\u043c\u0432.\n"
+		f"\u0422\u0435\u043a\u0443\u0449\u0438\u0439 \u043f\u0440\u043e\u043c\u043f\u0442: {status}.\n\n"
+		f"{PROMPT_INPUT_HINT}",
+		parse_mode="HTML",
+		reply_markup=cancel_action_keyboard()
+	)
+	await send_prompt_preview_file(
+		callback.message,
+		prompt,
+		filename,
+		f"\u0422\u0435\u043a\u0443\u0449\u0438\u0439 \u043f\u0440\u043e\u043c\u043f\u0442: {title}"
+	)
+	await state.set_state(target_state)
+	await callback.answer()
 
 
 def ai_config_menu_keyboard() -> InlineKeyboardMarkup:
@@ -320,12 +348,14 @@ async def cb_ignore_dialogue_header(callback: CallbackQuery):
 async def cb_set_ai_base_prompt(callback: CallbackQuery, state: FSMContext):
 	if not user_is_allowed(callback.from_user.id): await callback.answer("Нет прав."); return
 	current_val = get_config_value("ai_base_prompt", DEFAULT_AI_BASE_PROMPT)
-	await callback.message.edit_text(
-		f"Текущий базовый промпт (для комментариев):\n<pre>{html.escape(current_val)}</pre>\n\n{PROMPT_INPUT_HINT}",
-		parse_mode="HTML",
-		reply_markup=cancel_action_keyboard())
-	await state.set_state(AIConfigStates.WaitingForBasePrompt)
-	await callback.answer()
+	await show_ai_prompt_editor(
+		callback,
+		state,
+		"\u0411\u0430\u0437\u043e\u0432\u044b\u0439 \u043f\u0440\u043e\u043c\u043f\u0442 \u0434\u043b\u044f \u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u0435\u0432",
+		current_val,
+		AIConfigStates.WaitingForBasePrompt,
+		"ai_base_prompt.txt",
+	)
 
 
 @dp.message(AIConfigStates.WaitingForBasePrompt, F.text, ~F.text.startswith('/'))
@@ -340,12 +370,14 @@ async def process_ai_base_prompt(message: Message, state: FSMContext):
 async def cb_set_ai_welcome_prompt(callback: CallbackQuery, state: FSMContext):
 	if not user_is_allowed(callback.from_user.id): await callback.answer("Нет прав."); return
 	current_val = get_config_value("ai_welcome_message_prompt", "Приветствуем!")
-	await callback.message.edit_text(
-		f"Текущий приветственный промпт (для новых чатов):\n<pre>{html.escape(current_val)}</pre>\n\n{PROMPT_INPUT_HINT}",
-		parse_mode="HTML",
-		reply_markup=cancel_action_keyboard())
-	await state.set_state(AIConfigStates.WaitingForWelcomePrompt)
-	await callback.answer()
+	await show_ai_prompt_editor(
+		callback,
+		state,
+		"\u041f\u0440\u0438\u0432\u0435\u0442\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0439 \u043f\u0440\u043e\u043c\u043f\u0442",
+		current_val,
+		AIConfigStates.WaitingForWelcomePrompt,
+		"ai_welcome_prompt.txt",
+	)
 
 
 @dp.message(AIConfigStates.WaitingForWelcomePrompt, F.text, ~F.text.startswith('/'))
@@ -430,12 +462,14 @@ async def cb_set_ai_conv_prompt(callback: CallbackQuery, state: FSMContext):
 	if not user_is_allowed(callback.from_user.id): await callback.answer("Нет прав."); return
 	current_val = get_config_value("ai_base_prompt_conversation",
 									 "Ты — дружелюбный и полезный ИИ-собеседник. Продолжай диалог естественно и по существу.")
-	await callback.message.edit_text(
-		f"Текущий базовый промпт (для диалогов):\n<pre>{html.escape(current_val)}</pre>\n\n{PROMPT_INPUT_HINT}",
-		parse_mode="HTML",
-		reply_markup=cancel_action_keyboard())
-	await state.set_state(AIConfigStates.WaitingForConvPrompt)
-	await callback.answer()
+	await show_ai_prompt_editor(
+		callback,
+		state,
+		"\u0411\u0430\u0437\u043e\u0432\u044b\u0439 \u043f\u0440\u043e\u043c\u043f\u0442 \u0434\u043b\u044f \u0434\u0438\u0430\u043b\u043e\u0433\u043e\u0432",
+		current_val,
+		AIConfigStates.WaitingForConvPrompt,
+		"ai_dialogue_prompt.txt",
+	)
 
 
 @dp.message(AIConfigStates.WaitingForConvPrompt, F.text, ~F.text.startswith('/'))
