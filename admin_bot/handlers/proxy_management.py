@@ -8,9 +8,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 
-from db import (add_proxies_bulk, delete_all_proxies, delete_expired_proxies,
-                delete_proxy, get_db_connection, get_proxy_details,
-                get_proxy_summary, list_proxies)
+from db import get_db_connection
+from services.proxy_repository import (add_proxies_bulk, delete_all_proxies,
+                                       delete_expired_proxies, delete_proxy,
+                                       get_proxy_details, get_proxy_summary,
+                                       list_proxies)
 from services.proxy_health import (format_proxy_addr, progress_bar,
                                    proxy_display_status,
                                    run_proxy_health_check)

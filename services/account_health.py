@@ -14,9 +14,9 @@ from telethon.tl.functions.updates import GetStateRequest
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import InputUserSelf
 
-from db import (get_account_proxy_block_reason, get_db_connection,
-                get_workspace_session_dir, record_account_runtime_event,
+from db import (get_db_connection, get_workspace_session_dir, record_account_runtime_event,
                 update_account_health_status)
+from services.proxy_repository import get_account_proxy_block_reason
 
 
 FATAL_SESSION_ERRORS = (

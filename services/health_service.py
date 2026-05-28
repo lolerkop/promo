@@ -3,8 +3,8 @@ from datetime import datetime, timezone
 
 from db import (count_bot_errors, get_account_health_summary,
                 get_active_workspace_name, get_config_value, get_db_connection,
-                get_proxy_summary, list_account_runtime_state,
-                list_health_check_runs)
+                list_account_runtime_state, list_health_check_runs)
+from services.proxy_repository import get_proxy_summary
 
 
 def _table_count(table_name: str, where: str = "", params: tuple = ()) -> int:
@@ -99,4 +99,3 @@ def format_health_dashboard(snapshot: dict) -> str:
 			)
 
 	return "\n".join(lines)
-

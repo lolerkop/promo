@@ -7,7 +7,8 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 
 from db import (get_account_details, unassign_proxy_for_account,
-                update_account_proxy_settings, upsert_proxy_for_account)
+                update_account_proxy_settings)
+from services.proxy_repository import upsert_proxy_for_account
 from userbot import reinitialize_telethon_client
 
 from ..bot_instance import bot, dp

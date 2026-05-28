@@ -27,13 +27,13 @@ from telethon.utils import get_peer_id
 
 from ai_handler import generate_ai_response, template_response
 from db import (add_analytics_log, get_account_details,
-                get_account_proxy_block_reason,
                 get_active_category_prompt_for_chat, get_category_keywords,
                 get_config_value, get_current_workspace_id, get_db_connection,
                 get_workspace_session_dir,
                 list_workspaces, record_account_runtime_event, reset_workspace_context,
-                refresh_expired_proxies, set_config_value,
-                set_workspace_context, update_all_tables)
+                set_config_value, set_workspace_context, update_all_tables)
+from services.proxy_repository import (get_account_proxy_block_reason,
+                                       refresh_expired_proxies)
 from services.rotation import (get_accounts_ordered_for_cycle as rotation_get_accounts_ordered_for_cycle,
                                get_next_account_in_cycle as rotation_get_next_account_in_cycle,
                                record_account_cycle_success as rotation_record_account_cycle_success)

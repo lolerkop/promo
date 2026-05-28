@@ -24,12 +24,13 @@ from telethon.tl.types import (InputPrivacyKeyPhoneNumber,
                                InputPrivacyValueDisallowAll)
 
 from db import (create_account_with_proxy, get_account_details,
-                get_active_workspace_id, get_db_connection, get_unassigned_proxy,
+                get_active_workspace_id, get_db_connection,
                 get_workspace_session_dir,
                 remove_telethon_account)
 from services.account_health import (format_account_health_result,
                                      run_account_health_check)
 from services.proxy_health import progress_bar
+from services.proxy_repository import get_unassigned_proxy
 from userbot import (attach_authorized_client_to_runtime,
                      reinitialize_telethon_client, remove_client_from_runtime)
 

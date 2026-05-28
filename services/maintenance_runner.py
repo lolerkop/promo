@@ -1,8 +1,8 @@
 from datetime import datetime, timezone
 
-from db import (get_config_value, record_health_check_run,
-                refresh_expired_proxies, set_config_value)
+from db import get_config_value, record_health_check_run, set_config_value
 from services.account_health import run_account_health_check
+from services.proxy_repository import refresh_expired_proxies
 from services.proxy_health import run_proxy_health_check
 
 
@@ -93,4 +93,3 @@ async def run_scheduled_maintenance_for_current_workspace() -> dict:
 		summary["account_check"] = account_result
 
 	return summary
-

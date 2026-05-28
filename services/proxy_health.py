@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from db import get_all_proxies_for_check, update_proxy_check_result
+from services.proxy_repository import get_all_proxies_for_check, update_proxy_check_result
 
 
 def format_proxy_addr(proxy: dict) -> str:
@@ -140,4 +140,3 @@ async def run_proxy_health_check(concurrency: int = 5, progress_callback=None) -
 		"affected_accounts": sorted(affected_accounts),
 		"result_lines": result_lines,
 	}
-
