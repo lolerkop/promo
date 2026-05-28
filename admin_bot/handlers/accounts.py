@@ -104,6 +104,19 @@ def _pick_api_credentials_for_new_account() -> dict | None:
     return get_available_api_credential()
 
 
+def _format_phone_profile_link(phone: str | None) -> str:
+    if not phone:
+        return "-"
+    raw_phone = str(phone).strip()
+    if not raw_phone or raw_phone.startswith("uid_"):
+        return html.escape(raw_phone or "-")
+    digits = "".join(ch for ch in raw_phone if ch.isdigit())
+    if not digits:
+        return html.escape(raw_phone)
+    display_phone = f"+{digits}"
+    return f'<a href="tg://resolve?phone={digits}">{html.escape(display_phone)}</a>'
+
+
 def _safe_session_label(source_name: str) -> str:
     base_name = os.path.splitext(os.path.basename(source_name or ""))[0].strip()
     safe = "".join(ch if (ch.isalnum() or ch in ("_", "-")) else "_" for ch in base_name)
@@ -1192,7 +1205,7 @@ async def cb_manage_single_account_menu(callback: CallbackQuery, state: FSMConte
         return
 
     text = f"Управление аккаунтом: <b>{html.escape(acc_details['label'] or acc_details['session_name'])}</b> (ID: {account_id})\n"
-    text += f"Телефон: {acc_details['phone'] or '-'}\n"
+    text += f"Телефон: {_format_phone_profile_link(acc_details['phone'])}\n"
     text += f"User ID: {acc_details['user_id'] or '-'}\n"
     is_enabled = acc_details.get("is_enabled", 1)
     text += f"Статус работы: {'включен' if is_enabled else 'выключен'}\n"
