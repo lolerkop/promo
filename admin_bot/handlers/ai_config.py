@@ -16,9 +16,33 @@ from db import (add_openai_api_key, delete_openai_api_key, get_config_value,
 from ..bot_instance import (DEFAULT_AI_BASE_PROMPT, DEFAULT_AI_MAX_TOKENS,
                             DEFAULT_AI_TEMPERATURE, DEFAULT_OPENAI_MODEL, bot,
                             dp)
-from ..keyboards import main_menu_keyboard
+from ..keyboards import cancel_action_keyboard, main_menu_keyboard
+from ..prompt_files import read_prompt_document
 from ..states import AIConfigStates
 from ..utils import user_is_allowed
+from services.prompt_text import PromptTextError
+
+
+AI_PROMPT_DOCUMENT_TARGETS = {
+	AIConfigStates.WaitingForBasePrompt.state: (
+		"ai_base_prompt",
+		"\u0411\u0430\u0437\u043e\u0432\u044b\u0439 \u043f\u0440\u043e\u043c\u043f\u0442 (\u0434\u043b\u044f \u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u0435\u0432) \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d \u0438\u0437 .txt."
+	),
+	AIConfigStates.WaitingForWelcomePrompt.state: (
+		"ai_welcome_message_prompt",
+		"\u041f\u0440\u0438\u0432\u0435\u0442\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0439 \u043f\u0440\u043e\u043c\u043f\u0442 \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d \u0438\u0437 .txt."
+	),
+	AIConfigStates.WaitingForConvPrompt.state: (
+		"ai_base_prompt_conversation",
+		"\u0411\u0430\u0437\u043e\u0432\u044b\u0439 \u043f\u0440\u043e\u043c\u043f\u0442 (\u0434\u043b\u044f \u0434\u0438\u0430\u043b\u043e\u0433\u043e\u0432) \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d \u0438\u0437 .txt."
+	),
+}
+
+
+PROMPT_INPUT_HINT = (
+	"\u041c\u043e\u0436\u043d\u043e \u0432\u0432\u0435\u0441\u0442\u0438 \u0442\u0435\u043a\u0441\u0442 \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435\u043c "
+	"\u0438\u043b\u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c .txt \u0444\u0430\u0439\u043b \u0441 \u043f\u043e\u043b\u043d\u044b\u043c \u043f\u0440\u043e\u043c\u043f\u0442\u043e\u043c."
+)
 
 
 def ai_config_menu_keyboard() -> InlineKeyboardMarkup:
@@ -297,8 +321,9 @@ async def cb_set_ai_base_prompt(callback: CallbackQuery, state: FSMContext):
 	if not user_is_allowed(callback.from_user.id): await callback.answer("Нет прав."); return
 	current_val = get_config_value("ai_base_prompt", DEFAULT_AI_BASE_PROMPT)
 	await callback.message.edit_text(
-		f"Текущий базовый промпт (для комментариев):\n<pre>{html.escape(current_val)}</pre>\n\nВведите новый текст промпта:",
-		parse_mode="HTML")
+		f"Текущий базовый промпт (для комментариев):\n<pre>{html.escape(current_val)}</pre>\n\n{PROMPT_INPUT_HINT}",
+		parse_mode="HTML",
+		reply_markup=cancel_action_keyboard())
 	await state.set_state(AIConfigStates.WaitingForBasePrompt)
 	await callback.answer()
 
@@ -316,8 +341,9 @@ async def cb_set_ai_welcome_prompt(callback: CallbackQuery, state: FSMContext):
 	if not user_is_allowed(callback.from_user.id): await callback.answer("Нет прав."); return
 	current_val = get_config_value("ai_welcome_message_prompt", "Приветствуем!")
 	await callback.message.edit_text(
-		f"Текущий приветственный промпт (для новых чатов):\n<pre>{html.escape(current_val)}</pre>\n\nВведите новый текст промпта:",
-		parse_mode="HTML")
+		f"Текущий приветственный промпт (для новых чатов):\n<pre>{html.escape(current_val)}</pre>\n\n{PROMPT_INPUT_HINT}",
+		parse_mode="HTML",
+		reply_markup=cancel_action_keyboard())
 	await state.set_state(AIConfigStates.WaitingForWelcomePrompt)
 	await callback.answer()
 
@@ -405,8 +431,9 @@ async def cb_set_ai_conv_prompt(callback: CallbackQuery, state: FSMContext):
 	current_val = get_config_value("ai_base_prompt_conversation",
 									 "Ты — дружелюбный и полезный ИИ-собеседник. Продолжай диалог естественно и по существу.")
 	await callback.message.edit_text(
-		f"Текущий базовый промпт (для диалогов):\n<pre>{html.escape(current_val)}</pre>\n\nВведите новый текст промпта:",
-		parse_mode="HTML")
+		f"Текущий базовый промпт (для диалогов):\n<pre>{html.escape(current_val)}</pre>\n\n{PROMPT_INPUT_HINT}",
+		parse_mode="HTML",
+		reply_markup=cancel_action_keyboard())
 	await state.set_state(AIConfigStates.WaitingForConvPrompt)
 	await callback.answer()
 
@@ -417,6 +444,64 @@ async def process_ai_conv_prompt(message: Message, state: FSMContext):
 	set_config_value("ai_base_prompt_conversation", message.text.strip())
 	await message.answer("Базовый промпт (для диалогов) обновлен.", reply_markup=ai_config_menu_keyboard())
 	await state.clear()
+
+
+@dp.message(
+	StateFilter(
+		AIConfigStates.WaitingForBasePrompt,
+		AIConfigStates.WaitingForWelcomePrompt,
+		AIConfigStates.WaitingForConvPrompt,
+	),
+	F.document
+)
+async def process_ai_prompt_document(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("\u041d\u0435\u0442 \u043f\u0440\u0430\u0432.")
+		return
+
+	current_state = await state.get_state()
+	target = AI_PROMPT_DOCUMENT_TARGETS.get(current_state)
+	if not target:
+		await message.answer(
+			"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043e\u043f\u0440\u0435\u0434\u0435\u043b\u0438\u0442\u044c, \u043a\u0430\u043a\u043e\u0439 \u043f\u0440\u043e\u043c\u043f\u0442 \u043e\u0431\u043d\u043e\u0432\u043b\u044f\u0442\u044c.",
+			reply_markup=ai_config_menu_keyboard()
+		)
+		await state.clear()
+		return
+
+	try:
+		prompt_text = await read_prompt_document(message.document)
+	except PromptTextError as exc:
+		await message.answer(
+			f"\u26a0\ufe0f \u041f\u0440\u043e\u043c\u043f\u0442 \u043d\u0435 \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d: {html.escape(str(exc))}",
+			reply_markup=cancel_action_keyboard()
+		)
+		return
+
+	config_key, success_text = target
+	set_config_value(config_key, prompt_text)
+	await message.answer(
+		f"\u2705 {success_text}\n\u0414\u043b\u0438\u043d\u0430: {len(prompt_text)} \u0441\u0438\u043c\u0432.",
+		reply_markup=ai_config_menu_keyboard()
+	)
+	await state.clear()
+
+
+@dp.message(
+	StateFilter(
+		AIConfigStates.WaitingForBasePrompt,
+		AIConfigStates.WaitingForWelcomePrompt,
+		AIConfigStates.WaitingForConvPrompt,
+	),
+	~F.text.startswith('/')
+)
+async def process_ai_prompt_invalid_input(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		return
+	await message.answer(
+		"\u041e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 \u0442\u0435\u043a\u0441\u0442 \u043f\u0440\u043e\u043c\u043f\u0442\u0430 \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435\u043c \u0438\u043b\u0438 .txt \u0444\u0430\u0439\u043b. \u0414\u043b\u044f \u043e\u0442\u043c\u0435\u043d\u044b \u043d\u0430\u0436\u043c\u0438\u0442\u0435 \u043a\u043d\u043e\u043f\u043a\u0443.",
+		reply_markup=cancel_action_keyboard()
+	)
 
 
 @dp.callback_query(F.data == "set_ai_conv_tokens")

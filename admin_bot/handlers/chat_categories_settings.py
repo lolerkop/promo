@@ -12,17 +12,25 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from ..bot_instance import dp, bot
+from ..keyboards import cancel_action_keyboard
+from ..prompt_files import read_prompt_document
 from ..utils import user_is_allowed, get_entity_info_robust, subscribe_entity_logic
 from db import (
     get_db_connection,
     add_category_keyword, delete_category_keyword, get_category_keywords,
     record_entity_memberships, mark_entity_memberships_left
 )
+from services.prompt_text import PromptTextError
 from userbot import get_active_clients
 from ..states import CategoryRegularCommentStates
 
 CHAT_CATEGORIES_DIR = "chat_categories"
 MAX_CHATS_PER_PAGE_CAT = 9
+PROMPT_INPUT_HINT = (
+    "\u041c\u043e\u0436\u043d\u043e \u0432\u0432\u0435\u0441\u0442\u0438 \u0442\u0435\u043a\u0441\u0442 \u0438\u043b\u0438 "
+    "\u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c .txt \u0444\u0430\u0439\u043b \u0441 \u043f\u043e\u043b\u043d\u044b\u043c \u043f\u0440\u043e\u043c\u043f\u0442\u043e\u043c. "
+    "\u0414\u043b\u044f \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u044f \u043f\u0440\u043e\u043c\u043f\u0442\u0430 \u043e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 '-'."
+)
 
 
 class CategorySettingsStates(StatesGroup):
@@ -267,8 +275,9 @@ async def cb_set_cat_rc_prompt(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         f"<b>Категория: {category_name}</b>\n"
         f"Текущий промпт авто-комментария:\n<pre>{html.escape(current_prompt) if current_prompt else 'Не установлен'}</pre>\n\n"
-        "Введите новый промпт или отправьте '-' для его удаления.",
-        parse_mode="HTML"
+        f"{PROMPT_INPUT_HINT}",
+        parse_mode="HTML",
+        reply_markup=cancel_action_keyboard()
     )
     await state.set_state(CategoryRegularCommentStates.WaitingForPrompt)
     await callback.answer()
@@ -306,8 +315,9 @@ async def cb_set_category_prompt(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         f"<b>Категория: {category_name}</b>\n"
         f"Текущий промпт (для триггеров):\n<pre>{html.escape(current_prompt) if current_prompt else 'Не установлен'}</pre>\n\n"
-        "Введите новый промпт для этой категории или отправьте '-' для его удаления.",
-        parse_mode="HTML"
+        f"{PROMPT_INPUT_HINT}",
+        parse_mode="HTML",
+        reply_markup=cancel_action_keyboard()
     )
     await state.set_state(CategorySettingsStates.WaitingForCategoryPrompt)
     await callback.answer()
@@ -334,6 +344,84 @@ async def process_category_prompt(message: Message, state: FSMContext):
     await message.answer(f"Промпт для категории '{category_name}' обновлен.",
                          reply_markup=individual_category_menu_keyboard(category_name))
     await state.clear()
+
+
+async def _save_category_prompt_from_document(
+    message: Message,
+    state: FSMContext,
+    db_field: str,
+    success_template: str,
+):
+    data = await state.get_data()
+    category_name = data.get("current_category_name")
+    if not category_name:
+        await message.answer(
+            "\u041e\u0448\u0438\u0431\u043a\u0430: \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u044f \u043d\u0435 \u0432\u044b\u0431\u0440\u0430\u043d\u0430.",
+            reply_markup=chat_categories_main_menu_keyboard()
+        )
+        await state.clear()
+        return
+
+    try:
+        new_prompt = await read_prompt_document(message.document)
+    except PromptTextError as exc:
+        await message.answer(
+            f"\u26a0\ufe0f \u041f\u0440\u043e\u043c\u043f\u0442 \u043d\u0435 \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d: {html.escape(str(exc))}",
+            reply_markup=cancel_action_keyboard()
+        )
+        return
+
+    if new_prompt == "-":
+        new_prompt = ""
+
+    category_data = get_category_status(category_name)
+    category_data[db_field] = new_prompt
+    update_category_db(category_name, category_data)
+
+    await message.answer(
+        success_template.format(category_name=category_name, length=len(new_prompt)),
+        reply_markup=individual_category_menu_keyboard(category_name)
+    )
+    await state.clear()
+
+
+@dp.message(CategoryRegularCommentStates.WaitingForPrompt, F.document)
+async def process_cat_rc_prompt_document(message: Message, state: FSMContext):
+    if not user_is_allowed(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    await _save_category_prompt_from_document(
+        message,
+        state,
+        "regular_comment_prompt",
+        "\u2705 \u041f\u0440\u043e\u043c\u043f\u0442 \u0430\u0432\u0442\u043e-\u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u044f \u0434\u043b\u044f '{category_name}' \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d \u0438\u0437 .txt.\n\u0414\u043b\u0438\u043d\u0430: {length} \u0441\u0438\u043c\u0432."
+    )
+
+
+@dp.message(CategorySettingsStates.WaitingForCategoryPrompt, F.document)
+async def process_category_prompt_document(message: Message, state: FSMContext):
+    if not user_is_allowed(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    await _save_category_prompt_from_document(
+        message,
+        state,
+        "prompt",
+        "\u2705 \u041f\u0440\u043e\u043c\u043f\u0442 \u0434\u043b\u044f \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0438 '{category_name}' \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d \u0438\u0437 .txt.\n\u0414\u043b\u0438\u043d\u0430: {length} \u0441\u0438\u043c\u0432."
+    )
+
+
+@dp.message(
+    StateFilter(CategoryRegularCommentStates.WaitingForPrompt, CategorySettingsStates.WaitingForCategoryPrompt),
+    ~F.text.startswith('/')
+)
+async def process_category_prompt_invalid_input(message: Message, state: FSMContext):
+    if not user_is_allowed(message.from_user.id):
+        return
+    await message.answer(
+        "\u041e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 \u0442\u0435\u043a\u0441\u0442 \u043f\u0440\u043e\u043c\u043f\u0442\u0430 \u0438\u043b\u0438 .txt \u0444\u0430\u0439\u043b. \u0414\u043b\u044f \u043e\u0442\u043c\u0435\u043d\u044b \u043d\u0430\u0436\u043c\u0438\u0442\u0435 \u043a\u043d\u043e\u043f\u043a\u0443.",
+        reply_markup=cancel_action_keyboard()
+    )
 
 
 @dp.callback_query(F.data.startswith("set_cat_join_count:"))
