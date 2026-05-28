@@ -129,7 +129,7 @@ async def handle_channel_identifier(message: Message, state: FSMContext):
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT OR REPLACE INTO channels (id, username, title, enabled, assigned_account_id) VALUES (?, ?, ?, 1, ?)",
+            "INSERT OR REPLACE INTO channels (id, username, title, enabled, assigned_account_id) VALUES (?, ?, ?, 0, ?)",
             (
                 channel_info["id"], channel_info.get("username"), channel_info.get("title"),
                 assigned_account_id
@@ -144,7 +144,7 @@ async def handle_channel_identifier(message: Message, state: FSMContext):
             channel_identifier
         )
         await message.answer(
-            f"Channel '{html.escape(entity_title_display)}' (ID: {channel_info['id']}) added to database.")
+            f"Channel '{html.escape(entity_title_display)}' (ID: {channel_info['id']}) added to database and disabled.")
         asyncio.create_task(
             send_ai_welcome_message_to_chat(
                 admin_chat_id=admin_chat_id,

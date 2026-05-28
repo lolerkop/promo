@@ -1010,7 +1010,7 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                     conn_db = get_db_connection()
                     cursor_db = conn_db.cursor()
                     cursor_db.execute(
-                        "INSERT OR REPLACE INTO channels (id, username, title, enabled, linked_chat_id, assigned_account_id) VALUES (?, ?, ?, 1, ?, ?)",
+                        "INSERT OR REPLACE INTO channels (id, username, title, enabled, linked_chat_id, assigned_account_id) VALUES (?, ?, ?, 0, ?, ?)",
                         (channel_info["id"], channel_info.get("username"), channel_info.get("title"),
                          channel_info.get("linked_chat_id"), assigned_id)
                     )
@@ -1179,7 +1179,7 @@ async def subscribe_channels_bulk_in_bg(admin_chat_id: int, admin_user_id: int, 
                         await add_channel_to_db(ident_str, assigned_id, info_client, joined_account_ids_for_entity)
                         await update_progress(
                             current_item=ident_str,
-                            status="Joined and saved to database.",
+                            status="Joined and saved disabled to database.",
                             force=True
                         )
                     else:
