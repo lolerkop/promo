@@ -50,6 +50,13 @@ class AccountSettingsStates(StatesGroup):
 	WaitingForDMAutoReplyMessage = State()
 
 
+class ApiCredentialStates(StatesGroup):
+	WaitingForLabel = State()
+	WaitingForApiId = State()
+	WaitingForApiHash = State()
+	WaitingForMaxAccounts = State()
+
+
 class ChannelManagementStates(StatesGroup):
 	WaitingForChannelIdentifier = State()
 	WaitingForLinkedChatManual = State()

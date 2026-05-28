@@ -20,6 +20,7 @@ DB_MIGRATIONS = (
 	(1, "runtime_indexes"),
 	(2, "openai_only_provider"),
 	(3, "account_entity_memberships"),
+	(4, "telegram_api_credentials"),
 )
 _current_workspace_id = contextvars.ContextVar("current_workspace_id", default=None)
 
@@ -347,6 +348,20 @@ def create_tables():
 	""")
 
 	c.execute("""
+	CREATE TABLE IF NOT EXISTS telegram_api_credentials (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		api_id INTEGER NOT NULL,
+		api_hash TEXT NOT NULL,
+		label TEXT,
+		max_accounts INTEGER DEFAULT 10,
+		is_active INTEGER DEFAULT 1,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		UNIQUE(api_id, api_hash)
+	)
+	""")
+
+	c.execute("""
 	CREATE TABLE IF NOT EXISTS bot_error_log (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		timestamp TEXT NOT NULL,
@@ -551,11 +566,47 @@ def _migration_account_entity_memberships(cursor):
 	)
 
 
+def _migration_telegram_api_credentials(cursor):
+	now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+	cursor.execute("""
+		CREATE TABLE IF NOT EXISTS telegram_api_credentials (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			api_id INTEGER NOT NULL,
+			api_hash TEXT NOT NULL,
+			label TEXT,
+			max_accounts INTEGER DEFAULT 10,
+			is_active INTEGER DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			UNIQUE(api_id, api_hash)
+		)
+	""")
+	cursor.execute("""
+		INSERT OR IGNORE INTO telegram_api_credentials (
+			api_id, api_hash, label, max_accounts, is_active, created_at, updated_at
+		)
+		SELECT DISTINCT api_id, api_hash, 'API ' || api_id, 10, 1, ?, ?
+		FROM accounts
+		WHERE api_id IS NOT NULL
+		  AND api_hash IS NOT NULL
+		  AND api_hash != ''
+	""", (now, now))
+	cursor.execute(
+		"CREATE INDEX IF NOT EXISTS idx_telegram_api_credentials_active "
+		"ON telegram_api_credentials(is_active, api_id)"
+	)
+	cursor.execute(
+		"CREATE INDEX IF NOT EXISTS idx_accounts_api_pair "
+		"ON accounts(api_id, api_hash)"
+	)
+
+
 def run_migrations():
 	migration_handlers = {
 		1: _migration_runtime_indexes,
 		2: _migration_openai_only_provider,
 		3: _migration_account_entity_memberships,
+		4: _migration_telegram_api_credentials,
 	}
 	conn = get_db_connection()
 	c = conn.cursor()

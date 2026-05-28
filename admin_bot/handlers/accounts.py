@@ -29,6 +29,12 @@ from db import (create_account_with_proxy, get_account_details,
                 remove_telethon_account)
 from services.account_health import (format_account_health_result,
                                      run_account_health_check)
+from services.api_credentials import (DEFAULT_MAX_ACCOUNTS_PER_API,
+                                      add_api_credential,
+                                      delete_api_credential,
+                                      get_available_api_credential,
+                                      list_api_credentials,
+                                      set_api_credential_status)
 from services.proxy_health import progress_bar
 from services.proxy_repository import get_unassigned_proxy
 from userbot import (attach_authorized_client_to_runtime,
@@ -36,10 +42,66 @@ from userbot import (attach_authorized_client_to_runtime,
 
 from ..bot_instance import bot, dp, global_reg_cache
 from ..keyboards import main_menu_keyboard
-from ..states import (AccountAdditionStates, AccountManagementStates)
+from ..states import (AccountAdditionStates, AccountManagementStates,
+                      ApiCredentialStates)
 from ..utils import show_accounts_list, user_is_allowed
 
 logger = logging.getLogger(__name__)
+
+
+def _api_credentials_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="➕ Добавить API ID/HASH", callback_data="api_credential_add")]]
+    for credential in list_api_credentials():
+        status = "🟢" if credential.get("is_active") else "🔴"
+        label = credential.get("label") or f"API {credential.get('api_id')}"
+        used = int(credential.get("accounts_count") or 0)
+        max_accounts = int(credential.get("max_accounts") or DEFAULT_MAX_ACCOUNTS_PER_API)
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{status} {label[:18]} {used}/{max_accounts}",
+                callback_data=f"api_credential_ignore:{credential['id']}"
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                text="Выключить" if credential.get("is_active") else "Включить",
+                callback_data=f"api_credential_toggle:{credential['id']}"
+            ),
+            InlineKeyboardButton(text="Удалить", callback_data=f"api_credential_delete:{credential['id']}")
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="account_settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _format_api_credentials_menu() -> str:
+    credentials = list_api_credentials()
+    if not credentials:
+        return (
+            "<b>API ID/HASH</b>\n\n"
+            "Пары API пока не добавлены. Добавь хотя бы одну пару, и при входе аккаунтов бот будет сам выбирать "
+            f"самую свободную. По умолчанию лимит: {DEFAULT_MAX_ACCOUNTS_PER_API} аккаунтов на одну пару."
+        )
+
+    lines = [
+        "<b>API ID/HASH</b>",
+        "",
+        "Бот выбирает активную пару с минимальной нагрузкой.",
+        "",
+    ]
+    for credential in credentials:
+        status = "active" if credential.get("is_active") else "disabled"
+        used = int(credential.get("accounts_count") or 0)
+        max_accounts = int(credential.get("max_accounts") or DEFAULT_MAX_ACCOUNTS_PER_API)
+        label = html.escape(credential.get("label") or f"API {credential.get('api_id')}")
+        lines.append(
+            f"ID {credential['id']}: <b>{label}</b> | API <code>{credential['api_id']}</code> | "
+            f"{used}/{max_accounts} | {status}"
+        )
+    return "\n".join(lines)
+
+
+def _pick_api_credentials_for_new_account() -> dict | None:
+    return get_available_api_credential()
 
 
 @dp.callback_query(F.data == "account_settings")
@@ -50,6 +112,7 @@ async def cb_account_settings(callback: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗂️ Сканировать и импортировать сессии", callback_data="account_scan_and_import")],
         [InlineKeyboardButton(text="➕ Добавить по номеру телефона", callback_data="account_add")],
+        [InlineKeyboardButton(text="🔑 API ID/HASH", callback_data="api_credentials_menu")],
         [InlineKeyboardButton(text="🗂️ Массовое добавление прокси", callback_data="bulk_add_proxies_start")],
         [InlineKeyboardButton(text="📋 Управление прокси", callback_data="proxy_management")],
         [InlineKeyboardButton(text="❌ Удалить аккаунт", callback_data="account_remove_info")],
@@ -60,6 +123,135 @@ async def cb_account_settings(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="back_to_main_menu")]
     ])
     await callback.message.edit_text("⚙️ <b>Настройки аккаунтов</b>:", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "api_credentials_menu")
+async def cb_api_credentials_menu(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    await state.clear()
+    await callback.message.edit_text(_format_api_credentials_menu(), reply_markup=_api_credentials_menu_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "api_credential_add")
+async def cb_api_credential_add(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "Введите короткое имя для API-пары, например: main-1",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="api_credentials_menu")]]
+        )
+    )
+    await state.set_state(ApiCredentialStates.WaitingForLabel)
+    await callback.answer()
+
+
+@dp.message(ApiCredentialStates.WaitingForLabel, F.text, ~F.text.startswith('/'))
+async def handle_api_credential_label(message: Message, state: FSMContext):
+    if not user_is_allowed(message.from_user.id):
+        return
+    label = message.text.strip()
+    if not label:
+        await message.answer("Имя не должно быть пустым.")
+        return
+    await state.update_data(api_credential_label=label)
+    await message.answer("Введите API_ID числом.")
+    await state.set_state(ApiCredentialStates.WaitingForApiId)
+
+
+@dp.message(ApiCredentialStates.WaitingForApiId, F.text, ~F.text.startswith('/'))
+async def handle_api_credential_api_id(message: Message, state: FSMContext):
+    if not user_is_allowed(message.from_user.id):
+        return
+    if not message.text.strip().isdigit():
+        await message.answer("API_ID должен быть числом.")
+        return
+    await state.update_data(api_credential_api_id=int(message.text.strip()))
+    await message.answer("Введите API_HASH.")
+    await state.set_state(ApiCredentialStates.WaitingForApiHash)
+
+
+@dp.message(ApiCredentialStates.WaitingForApiHash, F.text, ~F.text.startswith('/'))
+async def handle_api_credential_api_hash(message: Message, state: FSMContext):
+    if not user_is_allowed(message.from_user.id):
+        return
+    api_hash = message.text.strip()
+    if not api_hash:
+        await message.answer("API_HASH не должен быть пустым.")
+        return
+    await state.update_data(api_credential_api_hash=api_hash)
+    await message.answer(f"Введите лимит аккаунтов на эту пару. По умолчанию: {DEFAULT_MAX_ACCOUNTS_PER_API}.")
+    await state.set_state(ApiCredentialStates.WaitingForMaxAccounts)
+
+
+@dp.message(ApiCredentialStates.WaitingForMaxAccounts, F.text, ~F.text.startswith('/'))
+async def handle_api_credential_max_accounts(message: Message, state: FSMContext):
+    if not user_is_allowed(message.from_user.id):
+        return
+    raw_value = message.text.strip()
+    if raw_value and not raw_value.isdigit():
+        await message.answer("Лимит должен быть числом.")
+        return
+    max_accounts = int(raw_value) if raw_value else DEFAULT_MAX_ACCOUNTS_PER_API
+    data = await state.get_data()
+    try:
+        add_api_credential(
+            api_id=data["api_credential_api_id"],
+            api_hash=data["api_credential_api_hash"],
+            label=data.get("api_credential_label"),
+            max_accounts=max_accounts,
+        )
+    except sqlite3.IntegrityError:
+        await message.answer("Такая API-пара уже есть в этом пространстве.", reply_markup=_api_credentials_menu_keyboard())
+    except Exception as e:
+        await message.answer(f"Не удалось добавить API-пару: {e}", reply_markup=_api_credentials_menu_keyboard())
+    else:
+        await message.answer("API-пара добавлена.", reply_markup=_api_credentials_menu_keyboard())
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("api_credential_toggle:"))
+async def cb_api_credential_toggle(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    try:
+        credential_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Неверный ID.", show_alert=True)
+        return
+    credential = next((item for item in list_api_credentials() if item["id"] == credential_id), None)
+    if not credential:
+        await callback.answer("API-пара не найдена.", show_alert=True)
+        return
+    set_api_credential_status(credential_id, not bool(credential.get("is_active")))
+    await callback.message.edit_text(_format_api_credentials_menu(), reply_markup=_api_credentials_menu_keyboard())
+    await callback.answer("Статус обновлен.")
+
+
+@dp.callback_query(F.data.startswith("api_credential_delete:"))
+async def cb_api_credential_delete(callback: CallbackQuery, state: FSMContext):
+    if not user_is_allowed(callback.from_user.id):
+        await callback.answer("Нет прав.")
+        return
+    try:
+        credential_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Неверный ID.", show_alert=True)
+        return
+    ok, message_text = delete_api_credential(credential_id)
+    await callback.message.edit_text(_format_api_credentials_menu(), reply_markup=_api_credentials_menu_keyboard())
+    await callback.answer(message_text, show_alert=not ok)
+
+
+@dp.callback_query(F.data.startswith("api_credential_ignore:"))
+async def cb_api_credential_ignore(callback: CallbackQuery):
     await callback.answer()
 
 
@@ -134,8 +326,20 @@ async def cb_scan_and_import_sessions(callback: CallbackQuery, state: FSMContext
 
             await bot.send_message(callback.from_user.id, f"▶️ Начинаю импорт аккаунта: {phone}")
 
-            api_id = data.get("app_id")
-            api_hash = data.get("app_hash")
+            credential = _pick_api_credentials_for_new_account()
+            if credential:
+                api_id = int(credential["api_id"])
+                api_hash = credential["api_hash"]
+            else:
+                api_id = data.get("app_id") or data.get("api_id")
+                api_hash = data.get("app_hash") or data.get("api_hash")
+            if not api_id or not api_hash:
+                await bot.send_message(
+                    callback.from_user.id,
+                    f"❌ Ошибка для `{json_filename}`: нет свободной API-пары в боте и нет app_id/app_hash в JSON."
+                )
+                error_count += 1
+                continue
             two_fa_pass = data.get("twoFA")
             label = f"acc_{phone}"
 
@@ -226,7 +430,26 @@ async def handle_account_add_phone(message: Message, state: FSMContext):
     if not user_is_allowed(message.from_user.id): return
     await state.update_data(phone=message.text.strip())
     logger.info(f"Admin {message.from_user.id}: State after phone: {await state.get_data()}")
-    await message.answer("Введите API_ID (число).")
+    credential = _pick_api_credentials_for_new_account()
+    if credential:
+        await state.update_data(
+            api_id=int(credential["api_id"]),
+            api_hash=credential["api_hash"],
+            api_credential_id=credential["id"],
+        )
+        used = int(credential.get("accounts_count") or 0)
+        max_accounts = int(credential.get("max_accounts") or DEFAULT_MAX_ACCOUNTS_PER_API)
+        label = html.escape(credential.get("label") or f"API {credential['api_id']}")
+        await message.answer(
+            f"Использую API-пару <b>{label}</b>: {used}/{max_accounts}. "
+            "Введите метку аккаунта (уникальное имя сессии, например account1)."
+        )
+        await state.set_state(AccountAdditionStates.WaitingForLabel)
+        return
+
+    await message.answer(
+        "Свободных API ID/HASH в этом пространстве нет. Добавьте API-пару в разделе аккаунтов или введите API_ID вручную."
+    )
     await state.set_state(AccountAdditionStates.WaitingForApiId)
 
 
