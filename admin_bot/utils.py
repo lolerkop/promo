@@ -710,6 +710,157 @@ async def subscribe_entity_logic(identifier: str, entity_type: str, admin_chat_i
     return stats, assigned_account_id
 
 
+def _get_active_clients_by_account_ids(account_ids: set[int] | None = None) -> list[tuple[TelegramClient, dict]]:
+    active = [(client, data) for client, data in get_active_clients() if client.is_connected()]
+    if not account_ids:
+        return active
+    return [(client, data) for client, data in active if data.get("id") in account_ids]
+
+
+def _get_entity_member_account_ids(entity_type: str, entity_id: int) -> set[int]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT account_id
+            FROM account_entity_memberships
+            WHERE entity_type = ? AND entity_id = ? AND status = 'active'
+            """,
+            (entity_type, entity_id)
+        )
+        return {int(row["account_id"]) for row in cursor.fetchall() if row["account_id"] is not None}
+    except Exception as exc:
+        logging.warning(
+            "Could not read %s membership account ids for %s: %s",
+            entity_type,
+            entity_id,
+            exc,
+        )
+        return set()
+    finally:
+        conn.close()
+
+
+async def _resolve_linked_chat_entity_for_client(
+        client: TelegramClient,
+        main_channel_id: int,
+        fallback_linked_chat_id: int | None = None,
+):
+    linked_chat_id = fallback_linked_chat_id
+    full_channel_details = await client(GetFullChannelRequest(channel=main_channel_id))
+    if getattr(full_channel_details.full_chat, "linked_chat_id", None):
+        linked_chat_id = full_channel_details.full_chat.linked_chat_id
+
+    if linked_chat_id is None:
+        return None, None
+
+    for chat_entity in full_channel_details.chats:
+        try:
+            if chat_entity.id == linked_chat_id or get_peer_id(chat_entity) == linked_chat_id:
+                return chat_entity, get_peer_id(chat_entity)
+        except Exception:
+            continue
+
+    lookup_candidates = [linked_chat_id]
+    if isinstance(linked_chat_id, int) and linked_chat_id > 0:
+        lookup_candidates.append(int(f"-100{linked_chat_id}"))
+    if fallback_linked_chat_id and fallback_linked_chat_id not in lookup_candidates:
+        lookup_candidates.append(fallback_linked_chat_id)
+
+    last_error = None
+    for candidate in lookup_candidates:
+        try:
+            entity = await client.get_entity(candidate)
+            return entity, get_peer_id(entity)
+        except Exception as exc:
+            last_error = exc
+
+    raise last_error or ValueError(f"Could not resolve linked chat for channel {main_channel_id}")
+
+
+async def subscribe_linked_chat_for_channel_accounts(
+        admin_chat_id: int,
+        main_channel_id: int,
+        linked_chat_id: int,
+        linked_chat_display_name: str,
+) -> tuple[dict, int | None]:
+    stats = _subscription_stats()
+    assigned_account_id = None
+    channel_member_ids = _get_entity_member_account_ids("channel", main_channel_id)
+    clients_to_try = _get_active_clients_by_account_ids(channel_member_ids)
+    if not clients_to_try:
+        clients_to_try = _get_active_clients_by_account_ids()
+
+    success_account_ids = []
+    for client, client_data in clients_to_try:
+        account_id = client_data.get("id")
+        label = client_data.get("label", client_data.get("session_name", f"ID {account_id}"))
+        try:
+            await _wait_for_channel_join_slot(client_data, admin_chat_id)
+            linked_chat_entity, resolved_peer_id = await _resolve_linked_chat_entity_for_client(
+                client,
+                main_channel_id,
+                linked_chat_id,
+            )
+            if not linked_chat_entity:
+                stats["failed"] += 1
+                record_account_runtime_event(account_id, "join", False, last_error="No linked chat")
+                continue
+
+            await client(JoinChannelRequest(linked_chat_entity))
+            _mark_join_success(stats, account_id)
+            success_account_ids.append(account_id)
+            record_account_runtime_event(account_id, "join", True)
+            if assigned_account_id is None:
+                assigned_account_id = account_id
+            logging.info(
+                "Linked discussion join OK: account %s joined %s (%s) for channel %s.",
+                label,
+                linked_chat_display_name,
+                resolved_peer_id,
+                main_channel_id,
+            )
+        except UserAlreadyParticipantError:
+            _mark_join_success(stats, account_id)
+            success_account_ids.append(account_id)
+            record_account_runtime_event(account_id, "join", True)
+            if assigned_account_id is None:
+                assigned_account_id = account_id
+        except FloodWaitError as exc:
+            stats["failed"] += 1
+            cooldown = int(exc.seconds) + random.randint(60, 180)
+            set_account_runtime_cooldown(account_id, "join", _cooldown_until_iso(cooldown), "linked discussion FloodWait")
+            record_account_runtime_event(
+                account_id,
+                "join",
+                False,
+                cooldown_until=_cooldown_until_iso(cooldown),
+                last_error=f"FloodWait {exc.seconds}s"
+            )
+            logging.warning("Linked discussion FloodWait for account %s: %ss.", label, exc.seconds)
+        except FATAL_ACCOUNT_ERRORS as exc:
+            stats["deleted"] += 1
+            await handle_banned_account(client_data, exc, admin_chat_id)
+            record_account_runtime_event(account_id, "join", False, last_error=type(exc).__name__)
+        except Exception as exc:
+            stats["failed"] += 1
+            record_account_runtime_event(account_id, "join", False, last_error=f"{type(exc).__name__}: {exc}")
+            logging.warning(
+                "Linked discussion join failed for account %s, channel %s, group %s: %s - %s",
+                label,
+                main_channel_id,
+                linked_chat_id,
+                type(exc).__name__,
+                exc,
+            )
+
+        await asyncio.sleep(random.uniform(0.8, 2.0))
+
+    record_entity_memberships(success_account_ids, "group", linked_chat_id, str(linked_chat_id))
+    return stats, assigned_account_id
+
+
 async def subscribe_groups_bulk_in_bg(admin_chat_id: int, admin_user_id: int, links: list[str]):
     task_id = f"task_{uuid.uuid4().hex[:8]}"
     workspace_id = get_active_workspace_id()
@@ -1579,7 +1730,21 @@ async def auto_handle_linked_chat_and_add_to_groups(admin_chat_id: int, main_cha
     await bot.send_message(admin_chat_id,
                            f"Найдена связанная группа: <b>{html.escape(linked_chat_display_name)}</b> (ID: {linked_chat_info_dict['id']}). Подписываю аккаунты используя '{identifier_for_join_call}'...")
 
-    stats, assigned_account_id = await subscribe_entity_logic(identifier_for_join_call, "group", admin_chat_id)
+    stats, assigned_account_id = await subscribe_linked_chat_for_channel_accounts(
+        admin_chat_id=admin_chat_id,
+        main_channel_id=main_channel_id,
+        linked_chat_id=linked_chat_info_dict["id"],
+        linked_chat_display_name=linked_chat_display_name,
+    )
+    await bot.send_message(
+        admin_chat_id,
+        (
+            f"Linked group join report for <b>{html.escape(linked_chat_display_name)}</b>:\n"
+            f"OK: <b>{stats['success']}</b>\n"
+            f"Failed: <b>{stats['failed']}</b>\n"
+            f"Deleted inactive: <b>{stats['deleted']}</b>"
+        )
+    )
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -1615,3 +1780,90 @@ async def auto_handle_linked_chat_and_add_to_groups(admin_chat_id: int, main_cha
         conn.close()
 
     return {"success": True, "linked_chat_info": linked_chat_info_dict}
+
+
+async def sync_linked_discussion_groups_for_all_channels(admin_chat_id: int) -> dict:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, username, title, linked_chat_id FROM channels")
+    channels = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    stats = {"processed": 0, "synced": 0, "skipped": 0, "failed": 0}
+    if not channels:
+        await bot.send_message(admin_chat_id, "В базе нет каналов для синхронизации групп обсуждений.")
+        return stats
+
+    progress_message = await bot.send_message(
+        admin_chat_id,
+        f"Начинаю синхронизацию групп обсуждений для {len(channels)} каналов..."
+    )
+
+    for channel in channels:
+        stats["processed"] += 1
+        channel_id = channel["id"]
+        channel_title = channel.get("title") or channel.get("username") or str(channel_id)
+        member_ids = _get_entity_member_account_ids("channel", channel_id)
+        candidate_clients = _get_active_clients_by_account_ids(member_ids) or _get_active_clients_by_account_ids()
+        if not candidate_clients:
+            stats["failed"] += 1
+            continue
+
+        info_client = candidate_clients[0][0]
+        channel_info = {
+            "id": channel_id,
+            "username": channel.get("username"),
+            "title": channel.get("title"),
+            "linked_chat_id": channel.get("linked_chat_id"),
+            "client_obj": info_client,
+        }
+
+        try:
+            result = await auto_handle_linked_chat_and_add_to_groups(
+                admin_chat_id=admin_chat_id,
+                main_channel_info=channel_info,
+                client_to_use=info_client,
+            )
+            if result.get("success"):
+                stats["synced"] += 1
+            else:
+                stats["skipped"] += 1
+        except Exception as exc:
+            stats["failed"] += 1
+            logging.error(
+                "Linked discussion sync failed for channel %s (%s): %s",
+                channel_title,
+                channel_id,
+                exc,
+                exc_info=True,
+            )
+
+        try:
+            await bot.edit_message_text(
+                (
+                    f"Синхронизация групп обсуждений...\n\n"
+                    f"Прогресс: {stats['processed']}/{len(channels)}\n"
+                    f"Синхронизировано: {stats['synced']}\n"
+                    f"Пропущено: {stats['skipped']}\n"
+                    f"Ошибок: {stats['failed']}"
+                ),
+                chat_id=admin_chat_id,
+                message_id=progress_message.message_id,
+            )
+        except Exception:
+            pass
+
+        await asyncio.sleep(random.uniform(1.0, 3.0))
+
+    summary = (
+        "<b>Синхронизация групп обсуждений завершена</b>\n\n"
+        f"Каналов обработано: <b>{stats['processed']}</b>\n"
+        f"Синхронизировано: <b>{stats['synced']}</b>\n"
+        f"Пропущено: <b>{stats['skipped']}</b>\n"
+        f"Ошибок: <b>{stats['failed']}</b>"
+    )
+    try:
+        await bot.edit_message_text(summary, chat_id=admin_chat_id, message_id=progress_message.message_id)
+    except Exception:
+        await bot.send_message(admin_chat_id, summary)
+    return stats
