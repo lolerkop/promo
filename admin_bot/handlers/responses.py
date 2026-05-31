@@ -11,11 +11,27 @@ from aiogram.types import (
 	Message,
 )
 
-from db import get_config_value, get_db_connection
+from db import get_config_value, get_db_connection, set_config_value
 
 from ..bot_instance import dp
 from ..keyboards import cancel_action_keyboard, main_menu_keyboard
+from ..prompt_files import read_prompt_document, send_prompt_preview_file
 from ..utils import user_is_allowed
+from services.prompt_text import PromptTextError
+
+
+DEFAULT_TRIGGER_AI_PROMPT = (
+	"Ты отвечаешь реплаем в Telegram-чате как обычный живой человек. "
+	"Твоя задача - коротко и естественно отреагировать на сообщение, где человеку может быть нужен VPN. "
+	"Не пиши как бот, не начинай с приветствия, не веди долгий диалог. "
+	"Ответ должен мягко подвести к VPN-сервису, но без агрессивной рекламы. "
+	"Если человек жалуется на блокировки, связь, глушилки или неработающие сервисы - покажи понимание и предложи VPN как практичное решение. "
+	"Пиши 1-2 коротких предложения."
+)
+
+DEFAULT_TRIGGER_AI_MODEL = "gpt-4o-mini"
+DEFAULT_TRIGGER_AI_TEMPERATURE = "0.8"
+DEFAULT_TRIGGER_AI_MAX_TOKENS = "120"
 
 
 def _response_type_label(response_type: str | None) -> str:
@@ -102,6 +118,47 @@ def _response_stats(responses: list[dict]) -> tuple[int, int, int]:
 	return total, ai_count, text_count
 
 
+def _get_trigger_ai_prompt() -> str:
+	return get_config_value("ai_trigger_prompt", DEFAULT_TRIGGER_AI_PROMPT)
+
+
+def _get_trigger_ai_model() -> str:
+	return get_config_value("ai_trigger_model", get_config_value("openai_model", DEFAULT_TRIGGER_AI_MODEL))
+
+
+def _get_trigger_ai_temperature() -> str:
+	return get_config_value("ai_trigger_temperature", DEFAULT_TRIGGER_AI_TEMPERATURE)
+
+
+def _get_trigger_ai_max_tokens() -> str:
+	return get_config_value("ai_trigger_max_tokens", DEFAULT_TRIGGER_AI_MAX_TOKENS)
+
+
+def _trigger_ai_settings_text() -> str:
+	prompt = _get_trigger_ai_prompt()
+	return (
+		"<b>AI-настройки триггеров</b>\n\n"
+		f"Модель: <code>{html.escape(_get_trigger_ai_model())}</code>\n"
+		f"Температура: <b>{html.escape(_get_trigger_ai_temperature())}</b>\n"
+		f"Макс. токены: <b>{html.escape(_get_trigger_ai_max_tokens())}</b>\n"
+		f"Промпт: <b>{len(prompt)}</b> симв.\n\n"
+		"Эти настройки используются только для ответов на триггеры. "
+		"Обычные автокомментарии и диалоги остаются на своих AI-настройках."
+	)
+
+
+def _trigger_ai_settings_keyboard() -> InlineKeyboardMarkup:
+	return InlineKeyboardMarkup(inline_keyboard=[
+		[InlineKeyboardButton(text="Промпт триггеров", callback_data="response_ai_prompt")],
+		[InlineKeyboardButton(text=f"Модель: {_get_trigger_ai_model()}", callback_data="response_ai_model")],
+		[
+			InlineKeyboardButton(text=f"Температура: {_get_trigger_ai_temperature()}", callback_data="response_ai_temperature"),
+			InlineKeyboardButton(text=f"Токены: {_get_trigger_ai_max_tokens()}", callback_data="response_ai_max_tokens"),
+		],
+		[InlineKeyboardButton(text="Назад к триггерам", callback_data="set_answer")],
+	])
+
+
 def _build_responses_file_text(responses: list[dict]) -> str:
 	total, ai_count, text_count = _response_stats(responses)
 	lines = [
@@ -135,6 +192,7 @@ def responses_menu_keyboard() -> InlineKeyboardMarkup:
 	return InlineKeyboardMarkup(inline_keyboard=[
 		[InlineKeyboardButton(text="Добавить / обновить триггер", callback_data="response_add_start")],
 		[InlineKeyboardButton(text="Список и общие настройки", callback_data="response_list")],
+		[InlineKeyboardButton(text="AI-настройки триггеров", callback_data="response_ai_settings")],
 		[InlineKeyboardButton(text="Назад в главное меню", callback_data="back_to_main_menu")]
 	])
 
@@ -160,6 +218,7 @@ def _responses_list_keyboard(has_responses: bool = True) -> InlineKeyboardMarkup
 		buttons.append([InlineKeyboardButton(text="Скачать список .txt", callback_data="response_export_txt")])
 		buttons.append([InlineKeyboardButton(text="Все триггеры в AI-режим", callback_data="response_all_ai_confirm")])
 		buttons.append([InlineKeyboardButton(text="Удалить все триггеры", callback_data="response_delete_all_confirm")])
+	buttons.append([InlineKeyboardButton(text="AI-настройки триггеров", callback_data="response_ai_settings")])
 	buttons.append([InlineKeyboardButton(text="Добавить / обновить триггер", callback_data="response_add_start")])
 	buttons.append([InlineKeyboardButton(text="Назад", callback_data="set_answer")])
 	return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -261,6 +320,84 @@ async def cb_response_export_txt(callback: CallbackQuery, state: FSMContext):
 	await callback.answer("Файл отправлен.")
 
 
+@dp.callback_query(F.data == "response_ai_settings")
+async def cb_response_ai_settings(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	await callback.message.edit_text(
+		_trigger_ai_settings_text(),
+		reply_markup=_trigger_ai_settings_keyboard()
+	)
+	await callback.answer()
+
+
+@dp.callback_query(F.data == "response_ai_prompt")
+async def cb_response_ai_prompt(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	current_prompt = _get_trigger_ai_prompt()
+	await callback.message.edit_text(
+		"<b>Промпт AI для триггеров</b>\n"
+		f"Текущая длина: <b>{len(current_prompt)}</b> симв.\n"
+		"Текущий промпт отправлен .txt файлом ниже.\n\n"
+		"Отправьте новый промпт сообщением или .txt файлом.",
+		reply_markup=cancel_action_keyboard()
+	)
+	await send_prompt_preview_file(
+		callback.message,
+		current_prompt,
+		"ai_trigger_prompt.txt",
+		"Текущий промпт AI для триггеров",
+	)
+	await state.set_state("waiting_for_trigger_ai_prompt")
+	await callback.answer()
+
+
+@dp.callback_query(F.data == "response_ai_model")
+async def cb_response_ai_model(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await callback.message.edit_text(
+		f"Текущая модель для триггеров: <code>{html.escape(_get_trigger_ai_model())}</code>\n"
+		"Введите новую модель, например <code>gpt-4o-mini</code>.",
+		reply_markup=cancel_action_keyboard()
+	)
+	await state.set_state("waiting_for_trigger_ai_model")
+	await callback.answer()
+
+
+@dp.callback_query(F.data == "response_ai_temperature")
+async def cb_response_ai_temperature(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await callback.message.edit_text(
+		f"Текущая температура для триггеров: <code>{html.escape(_get_trigger_ai_temperature())}</code>\n"
+		"Введите число от 0 до 2. Для живых ответов обычно норм: 0.7-1.0.",
+		reply_markup=cancel_action_keyboard()
+	)
+	await state.set_state("waiting_for_trigger_ai_temperature")
+	await callback.answer()
+
+
+@dp.callback_query(F.data == "response_ai_max_tokens")
+async def cb_response_ai_max_tokens(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await callback.message.edit_text(
+		f"Текущий лимит токенов для триггеров: <code>{html.escape(_get_trigger_ai_max_tokens())}</code>\n"
+		"Введите новое число. Для коротких ответов обычно хватает 80-150.",
+		reply_markup=cancel_action_keyboard()
+	)
+	await state.set_state("waiting_for_trigger_ai_max_tokens")
+	await callback.answer()
+
+
 @dp.callback_query(F.data == "response_all_ai_confirm")
 async def cb_response_all_ai_confirm(callback: CallbackQuery, state: FSMContext):
 	if not user_is_allowed(callback.from_user.id):
@@ -277,6 +414,94 @@ async def cb_response_all_ai_confirm(callback: CallbackQuery, state: FSMContext)
 		reply_markup=keyboard
 	)
 	await callback.answer()
+
+
+@dp.message(StateFilter("waiting_for_trigger_ai_prompt"), F.text, ~F.text.startswith('/'))
+async def handle_trigger_ai_prompt_text(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	prompt = message.text.strip()
+	if not prompt:
+		await message.answer("Промпт не может быть пустым.", reply_markup=cancel_action_keyboard())
+		return
+	set_config_value("ai_trigger_prompt", prompt)
+	await state.clear()
+	await message.answer(
+		f"Промпт AI для триггеров обновлен. Длина: {len(prompt)} симв.",
+		reply_markup=_trigger_ai_settings_keyboard()
+	)
+
+
+@dp.message(StateFilter("waiting_for_trigger_ai_prompt"), F.document)
+async def handle_trigger_ai_prompt_document(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	try:
+		prompt = await read_prompt_document(message.document)
+	except PromptTextError as exc:
+		await message.answer(
+			f"Промпт не обновлен: {html.escape(str(exc))}",
+			reply_markup=cancel_action_keyboard()
+		)
+		return
+	set_config_value("ai_trigger_prompt", prompt)
+	await state.clear()
+	await message.answer(
+		f"Промпт AI для триггеров обновлен из .txt. Длина: {len(prompt)} симв.",
+		reply_markup=_trigger_ai_settings_keyboard()
+	)
+
+
+@dp.message(StateFilter("waiting_for_trigger_ai_model"), F.text, ~F.text.startswith('/'))
+async def handle_trigger_ai_model(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	model = message.text.strip()
+	if not model:
+		await message.answer("Модель не может быть пустой.", reply_markup=cancel_action_keyboard())
+		return
+	set_config_value("ai_trigger_model", model)
+	await state.clear()
+	await message.answer("Модель AI для триггеров обновлена.", reply_markup=_trigger_ai_settings_keyboard())
+
+
+@dp.message(StateFilter("waiting_for_trigger_ai_temperature"), F.text, ~F.text.startswith('/'))
+async def handle_trigger_ai_temperature(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	try:
+		value = float(message.text.strip().replace(",", "."))
+	except ValueError:
+		await message.answer("Введите число, например 0.8.", reply_markup=cancel_action_keyboard())
+		return
+	if not 0 <= value <= 2:
+		await message.answer("Температура должна быть от 0 до 2.", reply_markup=cancel_action_keyboard())
+		return
+	set_config_value("ai_trigger_temperature", str(value))
+	await state.clear()
+	await message.answer("Температура AI для триггеров обновлена.", reply_markup=_trigger_ai_settings_keyboard())
+
+
+@dp.message(StateFilter("waiting_for_trigger_ai_max_tokens"), F.text, ~F.text.startswith('/'))
+async def handle_trigger_ai_max_tokens(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	try:
+		value = int(message.text.strip())
+	except ValueError:
+		await message.answer("Введите целое число, например 120.", reply_markup=cancel_action_keyboard())
+		return
+	if not 1 <= value <= 4000:
+		await message.answer("Лимит должен быть от 1 до 4000.", reply_markup=cancel_action_keyboard())
+		return
+	set_config_value("ai_trigger_max_tokens", str(value))
+	await state.clear()
+	await message.answer("Лимит токенов AI для триггеров обновлен.", reply_markup=_trigger_ai_settings_keyboard())
 
 
 @dp.callback_query(F.data == "response_all_ai")

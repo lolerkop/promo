@@ -60,6 +60,17 @@ async def main_bot_polling_task():
 		"ai_temperature": DEFAULT_AI_TEMPERATURE,
 		"ai_provider": "openai",
 		"ai_max_tokens": DEFAULT_AI_MAX_TOKENS,
+		"ai_trigger_prompt": (
+			"Ты отвечаешь реплаем в Telegram-чате как обычный живой человек. "
+			"Твоя задача - коротко и естественно отреагировать на сообщение, где человеку может быть нужен VPN. "
+			"Не пиши как бот, не начинай с приветствия, не веди долгий диалог. "
+			"Ответ должен мягко подвести к VPN-сервису, но без агрессивной рекламы. "
+			"Если человек жалуется на блокировки, связь, глушилки или неработающие сервисы - покажи понимание и предложи VPN как практичное решение. "
+			"Пиши 1-2 коротких предложения."
+		),
+		"ai_trigger_model": DEFAULT_OPENAI_MODEL,
+		"ai_trigger_temperature": "0.8",
+		"ai_trigger_max_tokens": "120",
 		"listen_all": "True",
 		"REGULAR_COMMENT_ENABLED": "0", "REGULAR_COMMENT_INTERVAL": "60",
 		"reporting_enabled": "False",

@@ -69,6 +69,15 @@ START_TIME = datetime.now(timezone.utc)
 conversation_tracker = defaultdict(lambda: defaultdict(int))
 client_tasks: dict[int, asyncio.Task] = {}
 
+DEFAULT_TRIGGER_AI_PROMPT = (
+	"Ты отвечаешь реплаем в Telegram-чате как обычный живой человек. "
+	"Твоя задача - коротко и естественно отреагировать на сообщение, где человеку может быть нужен VPN. "
+	"Не пиши как бот, не начинай с приветствия, не веди долгий диалог. "
+	"Ответ должен мягко подвести к VPN-сервису, но без агрессивной рекламы. "
+	"Если человек жалуется на блокировки, связь, глушилки или неработающие сервисы - покажи понимание и предложи VPN как практичное решение. "
+	"Пиши 1-2 коротких предложения."
+)
+
 CLEANUP_INTERVAL_SECONDS = 300
 POST_LOCK_TIMEOUT_SECONDS = 900
 
@@ -244,7 +253,7 @@ def humanize_ai_text(text: str) -> str:
 		return original_text
 
 
-def generate_vpn_comment(context: str = None, current_account_id_for_log: int = None, chat_id_for_prompt: int = None, dialogue_history: list = None) -> str:
+def generate_vpn_comment(context: str = None, current_account_id_for_log: int = None, chat_id_for_prompt: int = None, dialogue_history: list = None, generation_mode: str = "comment") -> str:
 		use_ai = get_config_value("use_ai", "True").lower() == 'true'
 		if not use_ai:
 			logging.info(f"generate_vpn_comment: Ai отключен, используется шаблон.")
@@ -256,8 +265,12 @@ def generate_vpn_comment(context: str = None, current_account_id_for_log: int = 
 		category_prompt = None
 		base_prompt_key = "ai_base_prompt"
 		max_tokens_key = "ai_max_tokens"
+		model_key = "openai_model"
+		temperature_key = "ai_temperature"
 		default_base_prompt_val = "Ты — копирайтер, который пишет уникальные, интересные и вовлекающие комментарии на разные темы."
 		default_max_tokens_val = "150"
+		default_model_val = "gpt-3.5-turbo"
+		default_temperature_val = "0.7"
 
 		persona_system_message_content = "Ты общаешься как обычный, дружелюбный человек в чате. Твои ответы должны быть неформальными и естественными. Избегай любых фраз, которые могут выдать в тебе ИИ или бота. Не используй официальные приветствия или прощания. Будь краток и по делу, как будто ты просто делишься мнением или отвечаешь на вопрос."
 
@@ -267,6 +280,15 @@ def generate_vpn_comment(context: str = None, current_account_id_for_log: int = 
 				default_base_prompt_val = get_config_value(base_prompt_key,
 																									 "Ты — хороший собеседник, который хочет поддержать тему. Продолжай диалог.")
 				default_max_tokens_val = get_config_value(max_tokens_key, "100")
+		elif generation_mode == "trigger":
+				base_prompt_key = "ai_trigger_prompt"
+				max_tokens_key = "ai_trigger_max_tokens"
+				model_key = "ai_trigger_model"
+				temperature_key = "ai_trigger_temperature"
+				default_base_prompt_val = DEFAULT_TRIGGER_AI_PROMPT
+				default_max_tokens_val = "120"
+				default_model_val = get_config_value("openai_model", "gpt-4o-mini")
+				default_temperature_val = "0.8"
 
 		if chat_id_for_prompt:
 				category_prompt_from_db = get_active_category_prompt_for_chat(chat_id_for_prompt)
@@ -276,12 +298,12 @@ def generate_vpn_comment(context: str = None, current_account_id_for_log: int = 
 		base_prompt_to_use = category_prompt if category_prompt else get_config_value(base_prompt_key,
 																																									default_base_prompt_val)
 
-		openai_model_db = get_config_value("openai_model", "gpt-3.5-turbo")
+		openai_model_db = get_config_value(model_key, default_model_val)
 		ai_provider_db = get_config_value("ai_provider", "openai")
 		try:
-				temperature_db = float(get_config_value("ai_temperature", "0.7"))
+				temperature_db = float(get_config_value(temperature_key, default_temperature_val))
 		except ValueError:
-				temperature_db = 0.7
+				temperature_db = float(default_temperature_val)
 		try:
 				max_tokens_db = int(get_config_value(max_tokens_key, default_max_tokens_val))
 		except ValueError:
@@ -296,7 +318,10 @@ def generate_vpn_comment(context: str = None, current_account_id_for_log: int = 
 				messages_for_api.append({"role": "system", "content": persona_system_message_content})
 				final_user_prompt = base_prompt_to_use
 				if context:
-						final_user_prompt += f"\n\nУчитывая эту главную инструкцию, напиши релевантный комментарий к следующему посту (или теме):\n---\n{context}\n---"
+						if generation_mode == "trigger":
+								final_user_prompt += f"\n\nСообщение в чате, на которое нужно ответить реплаем:\n---\n{context}\n---\n\nНапиши только сам ответ. Без кавычек, пояснений и префиксов."
+						else:
+								final_user_prompt += f"\n\nУчитывая эту главную инструкцию, напиши релевантный комментарий к следующему посту (или теме):\n---\n{context}\n---"
 				messages_for_api.append({"role": "user", "content": final_user_prompt})
 
 		try:
@@ -607,7 +632,8 @@ async def on_new_message_handler(event, client_obj, client_data):
 														generate_vpn_comment,
 														context=event.raw_text,
 														current_account_id_for_log=account_db_id,
-														chat_id_for_prompt=chat_id
+														chat_id_for_prompt=chat_id,
+														generation_mode="trigger",
 												)
 
 										await send_rotating_chat_reply(
@@ -655,6 +681,7 @@ async def on_new_message_handler(event, client_obj, client_data):
 																context=event.raw_text,
 																current_account_id_for_log=account_db_id,
 																chat_id_for_prompt=None,
+																generation_mode="trigger",
 														)
 
 												await send_rotating_chat_reply(
