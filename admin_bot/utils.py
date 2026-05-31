@@ -129,6 +129,30 @@ def _linked_group_join_gap_seconds() -> int:
     return random.randint(gap_min, gap_max)
 
 
+def _linked_group_accounts_min() -> int:
+    return _get_int_config_value("linked_group_accounts_per_group_min", 5, 1)
+
+
+def _linked_group_accounts_max() -> int:
+    min_value = _linked_group_accounts_min()
+    max_value = _get_int_config_value("linked_group_accounts_per_group_max", 7, min_value)
+    return max(max_value, min_value)
+
+
+def _target_linked_group_account_count(group_id: int | str | None, available_count: int) -> int:
+    if available_count <= 0:
+        return 0
+    min_value = _linked_group_accounts_min()
+    max_value = _linked_group_accounts_max()
+    span = max_value - min_value + 1
+    try:
+        stable_seed = abs(int(group_id or 0))
+    except (TypeError, ValueError):
+        stable_seed = abs(hash(str(group_id)))
+    target = min_value + (stable_seed % span)
+    return min(target, available_count)
+
+
 def _cooldown_until_iso(seconds_from_now: int) -> str:
     return datetime.fromtimestamp(time.time() + max(0, int(seconds_from_now)), timezone.utc).isoformat(timespec="seconds")
 
@@ -726,17 +750,39 @@ def _get_active_clients_by_account_ids(account_ids: set[int] | None = None) -> l
     return [(client, data) for client, data in active if data.get("id") in account_ids]
 
 
+def _entity_id_variants(entity_id: int | str) -> list[int]:
+    try:
+        value = int(entity_id)
+    except (TypeError, ValueError):
+        return []
+    variants = {value}
+    if value > 0:
+        variants.add(-value)
+        variants.add(int(f"-100{value}"))
+    else:
+        abs_text = str(abs(value))
+        variants.add(abs(value))
+        if abs_text.startswith("100") and len(abs_text) > 3:
+            variants.add(int(abs_text[3:]))
+    return list(variants)
+
+
 def _get_entity_member_account_ids(entity_type: str, entity_id: int) -> set[int]:
+    id_variants = _entity_id_variants(entity_id)
+    if not id_variants:
+        return set()
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
-            """
+            f"""
             SELECT account_id
             FROM account_entity_memberships
-            WHERE entity_type = ? AND entity_id = ? AND status = 'active'
+            WHERE entity_type = ?
+              AND entity_id IN ({",".join("?" for _ in id_variants)})
+              AND status = 'active'
             """,
-            (entity_type, entity_id)
+            (entity_type, *id_variants)
         )
         return {int(row["account_id"]) for row in cursor.fetchall() if row["account_id"] is not None}
     except Exception as exc:
@@ -749,6 +795,10 @@ def _get_entity_member_account_ids(entity_type: str, entity_id: int) -> set[int]
         return set()
     finally:
         conn.close()
+
+
+def _active_linked_group_member_count(group_id: int) -> int:
+    return len(_get_entity_member_account_ids("group", group_id))
 
 
 async def _resolve_linked_chat_entity_for_client(
@@ -795,13 +845,30 @@ async def subscribe_linked_chat_for_channel_accounts(
         linked_chat_display_name: str,
         notify: bool = True,
         progress_hook=None,
+        target_account_count: int | None = None,
 ) -> tuple[dict, int | None]:
     stats = _subscription_stats()
     assigned_account_id = None
     channel_member_ids = _get_entity_member_account_ids("channel", main_channel_id)
+    existing_group_member_ids = _get_entity_member_account_ids("group", linked_chat_id)
     clients_to_try = _get_active_clients_by_account_ids(channel_member_ids)
     if not clients_to_try:
         clients_to_try = _get_active_clients_by_account_ids()
+
+    target_count = target_account_count or _target_linked_group_account_count(linked_chat_id, len(clients_to_try))
+    already_count = len(existing_group_member_ids)
+    needed_count = max(0, target_count - already_count)
+    if needed_count <= 0:
+        stats["already_enough"] = True
+        stats["existing_members"] = already_count
+        stats["target_members"] = target_count
+        return stats, next(iter(existing_group_member_ids), None)
+
+    clients_to_try = [
+        (client, data)
+        for client, data in _order_clients_for_balanced_subscription(clients_to_try)
+        if data.get("id") not in existing_group_member_ids
+    ][:needed_count]
 
     success_account_ids = []
     total_clients = len(clients_to_try)
@@ -832,6 +899,7 @@ async def subscribe_linked_chat_for_channel_accounts(
             await client(JoinChannelRequest(linked_chat_entity))
             _mark_join_success(stats, account_id)
             success_account_ids.append(account_id)
+            record_entity_memberships([account_id], "group", linked_chat_id, str(linked_chat_id))
             record_account_runtime_event(account_id, "join", True)
             if assigned_account_id is None:
                 assigned_account_id = account_id
@@ -845,6 +913,7 @@ async def subscribe_linked_chat_for_channel_accounts(
         except UserAlreadyParticipantError:
             _mark_join_success(stats, account_id)
             success_account_ids.append(account_id)
+            record_entity_memberships([account_id], "group", linked_chat_id, str(linked_chat_id))
             record_account_runtime_event(account_id, "join", True)
             if assigned_account_id is None:
                 assigned_account_id = account_id
@@ -901,6 +970,8 @@ async def subscribe_linked_chat_for_channel_accounts(
             await asyncio.sleep(gap)
 
     record_entity_memberships(success_account_ids, "group", linked_chat_id, str(linked_chat_id))
+    stats["existing_members"] = already_count
+    stats["target_members"] = target_count
     return stats, assigned_account_id
 
 
@@ -1826,11 +1897,11 @@ async def auto_handle_linked_chat_and_add_to_groups(admin_chat_id: int, main_cha
             await bot.send_message(admin_chat_id,
                                    f"⚠️ Не удалось добавить связанную группу {html.escape(linked_chat_display_name)} в раздел 'Чаты': Ошибка БД.")
         return {"success": False, "message": "Ошибка при добавлении связанной группы в БД.",
-                "linked_chat_info": linked_chat_info_dict}
+                "linked_chat_info": linked_chat_info_dict, "stats": stats}
     finally:
         conn.close()
 
-    return {"success": True, "linked_chat_info": linked_chat_info_dict}
+    return {"success": True, "linked_chat_info": linked_chat_info_dict, "stats": stats}
 
 
 async def start_linked_discussion_sync_task(admin_chat_id: int) -> str:
@@ -1859,9 +1930,18 @@ async def start_linked_discussion_sync_task(admin_chat_id: int) -> str:
             for channel in channels:
                 member_ids = _get_entity_member_account_ids("channel", channel["id"])
                 candidate_clients = _get_active_clients_by_account_ids(member_ids) or _get_active_clients_by_account_ids()
-                plans.append((channel, max(1, len(candidate_clients))))
+                linked_chat_id = None
+                try:
+                    if channel.get("linked_chat_id"):
+                        linked_chat_id = int(channel.get("linked_chat_id"))
+                except (TypeError, ValueError):
+                    linked_chat_id = None
+                target_count = _target_linked_group_account_count(linked_chat_id or channel["id"], len(candidate_clients))
+                existing_count = _active_linked_group_member_count(linked_chat_id) if linked_chat_id else 0
+                remaining_count = max(0, target_count - existing_count)
+                plans.append((channel, max(1, remaining_count), target_count, existing_count, linked_chat_id))
 
-            total_units = sum(plan_units for _, plan_units in plans) or len(channels) or 1
+            total_units = sum(plan_units for _, plan_units, _, _, _ in plans) or len(channels) or 1
             progress = active_background_tasks[task_id].setdefault("progress", {})
             progress.update({
                 "total": total_units,
@@ -1881,7 +1961,7 @@ async def start_linked_discussion_sync_task(admin_chat_id: int) -> str:
             if channel_gap_max < channel_gap_min:
                 channel_gap_max = channel_gap_min
 
-            for channel, planned_units in plans:
+            for channel, planned_units, target_count, existing_count, linked_chat_id in plans:
                 channel_id = channel["id"]
                 channel_title = channel.get("title") or channel.get("username") or str(channel_id)
                 stats["channels_processed"] += 1
@@ -1900,6 +1980,16 @@ async def start_linked_discussion_sync_task(admin_chat_id: int) -> str:
                     progress.update({
                         "completed": min(completed_units, total_units),
                         "status": "Нет подключенных аккаунтов для канала.",
+                        "stats": dict(stats),
+                    })
+                    continue
+
+                if linked_chat_id and existing_count >= target_count:
+                    stats["channels_skipped"] += 1
+                    completed_units += planned_units
+                    progress.update({
+                        "completed": min(completed_units, total_units),
+                        "status": f"Уже синхронизировано: {existing_count}/{target_count} аккаунтов.",
                         "stats": dict(stats),
                     })
                     continue
@@ -1955,7 +2045,10 @@ async def start_linked_discussion_sync_task(admin_chat_id: int) -> str:
                         notify=False,
                         progress_hook=progress_hook,
                     )
-                    if result.get("success"):
+                    result_stats = result.get("stats") or {}
+                    if result_stats.get("already_enough"):
+                        stats["channels_skipped"] += 1
+                    elif result.get("success"):
                         stats["channels_synced"] += 1
                     else:
                         stats["channels_skipped"] += 1
