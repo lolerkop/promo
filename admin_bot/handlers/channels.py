@@ -18,7 +18,7 @@ from ..utils import (
     send_ai_welcome_message_to_chat,
     auto_handle_linked_chat_and_add_to_groups,
     remove_group_from_db_and_leave,
-    sync_linked_discussion_groups_for_all_channels
+    start_linked_discussion_sync_task
 )
 from ..keyboards import build_channels_keyboard, cancel_action_keyboard, main_menu_keyboard
 from ..states import ChannelManagementStates
@@ -52,7 +52,7 @@ async def cb_sync_linked_discussion_groups(callback: CallbackQuery, state: FSMCo
         return
     await state.clear()
     await callback.answer("Запускаю синхронизацию.")
-    asyncio.create_task(sync_linked_discussion_groups_for_all_channels(callback.message.chat.id))
+    await start_linked_discussion_sync_task(callback.message.chat.id)
 
 
 @dp.callback_query(F.data == "add_channel_options")
