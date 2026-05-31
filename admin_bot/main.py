@@ -11,11 +11,11 @@ from .bot_instance import (DEFAULT_AI_BASE_PROMPT, DEFAULT_AI_MAX_TOKENS,
                            DEFAULT_AI_TEMPERATURE, DEFAULT_OPENAI_MODEL,
                            TEMP_PHOTO_DIR, bot, dp)
 from .handlers import (account_profile, account_proxy, accounts, ai_config,
-                       analytics, channels, chat_categories_settings, common,
-                       dm_auto_responder, general_settings, groups,
+                       analytics, channels, chat_categories_settings, responses,
+                       common, dm_auto_responder, general_settings, groups,
                        maintenance, profile_update, proxy_management,
                        regular_comment,
-                       reporting_settings, responses, task_management)
+                       reporting_settings, task_management)
 
 
 async def set_bot_commands():

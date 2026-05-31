@@ -1,10 +1,15 @@
 import html
 
 from aiogram import F
-from aiogram.filters import StateFilter
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import (CallbackQuery, InlineKeyboardButton,
-                           InlineKeyboardMarkup, Message)
+from aiogram.types import (
+	BufferedInputFile,
+	CallbackQuery,
+	InlineKeyboardButton,
+	InlineKeyboardMarkup,
+	Message,
+)
 
 from db import get_config_value, get_db_connection
 
@@ -13,7 +18,7 @@ from ..keyboards import cancel_action_keyboard, main_menu_keyboard
 from ..utils import user_is_allowed
 
 
-def _response_type_label(response_type: str) -> str:
+def _response_type_label(response_type: str | None) -> str:
 	return "AI" if response_type == "openai" else "текст"
 
 
@@ -70,48 +75,102 @@ def _delete_response(response_id: int) -> bool:
 	return deleted
 
 
+def _set_all_responses_ai() -> int:
+	conn = get_db_connection()
+	cursor = conn.cursor()
+	cursor.execute("UPDATE responses SET answer = '', response_type = 'openai'")
+	updated = cursor.rowcount
+	conn.commit()
+	conn.close()
+	return updated
+
+
+def _delete_all_responses() -> int:
+	conn = get_db_connection()
+	cursor = conn.cursor()
+	cursor.execute("DELETE FROM responses")
+	deleted = cursor.rowcount
+	conn.commit()
+	conn.close()
+	return deleted
+
+
+def _response_stats(responses: list[dict]) -> tuple[int, int, int]:
+	total = len(responses)
+	ai_count = sum(1 for item in responses if item.get("response_type") == "openai")
+	text_count = total - ai_count
+	return total, ai_count, text_count
+
+
+def _build_responses_file_text(responses: list[dict]) -> str:
+	total, ai_count, text_count = _response_stats(responses)
+	lines = [
+		"Список триггеров",
+		f"Всего: {total}",
+		f"AI: {ai_count}",
+		f"Готовый текст: {text_count}",
+		"",
+	]
+	for index, item in enumerate(responses, start=1):
+		keyword = str(item.get("keyword") or "").strip()
+		response_type = _response_type_label(item.get("response_type"))
+		lines.append(f"{index}. [{response_type}] {keyword}")
+	return "\n".join(lines).strip() + "\n"
+
+
+async def _send_responses_file(message: Message, responses: list[dict]) -> None:
+	if not responses:
+		return
+	document = BufferedInputFile(
+		_build_responses_file_text(responses).encode("utf-8"),
+		filename="triggers.txt",
+	)
+	await message.answer_document(
+		document=document,
+		caption="Список триггеров отправил файлом, чтобы меню не превращалось в простыню."
+	)
+
+
 def responses_menu_keyboard() -> InlineKeyboardMarkup:
 	return InlineKeyboardMarkup(inline_keyboard=[
-		[InlineKeyboardButton(text="➕ Добавить / обновить триггер", callback_data="response_add_start")],
-		[InlineKeyboardButton(text="📋 Список триггеров", callback_data="response_list")],
-		[InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="back_to_main_menu")]
+		[InlineKeyboardButton(text="Добавить / обновить триггер", callback_data="response_add_start")],
+		[InlineKeyboardButton(text="Список и общие настройки", callback_data="response_list")],
+		[InlineKeyboardButton(text="Назад в главное меню", callback_data="back_to_main_menu")]
 	])
 
 
 def _responses_menu_text() -> str:
 	responses = _fetch_responses()
+	total, ai_count, text_count = _response_stats(responses)
 	listen_all = get_config_value("listen_all", "True").lower() == "true"
 	tracking_text = "все чаты" if listen_all else "только включенные группы/категории из БД"
 	return (
 		"<b>Ответы на триггеры</b>\n\n"
-		f"Всего триггеров: <b>{len(responses)}</b>\n"
+		f"Всего триггеров: <b>{total}</b>\n"
+		f"AI-ответов: <b>{ai_count}</b>\n"
+		f"Готовых текстов: <b>{text_count}</b>\n"
 		f"Режим отслеживания: <b>{tracking_text}</b>\n\n"
-		"Когда аккаунт видит сообщение с ключевым словом, он отвечает в этот чат реплаем."
+		"Когда аккаунт видит сообщение с ключевой фразой, он отвечает реплаем в этот чат."
 	)
 
 
-def _responses_list_keyboard() -> InlineKeyboardMarkup:
+def _responses_list_keyboard(has_responses: bool = True) -> InlineKeyboardMarkup:
 	buttons = []
-	for item in _fetch_responses():
-		keyword = item["keyword"]
-		response_type = _response_type_label(item["response_type"])
-		button_text = f"{keyword[:28]} [{response_type}]"
-		if len(keyword) > 28:
-			button_text = f"{keyword[:28]}... [{response_type}]"
-		buttons.append([
-			InlineKeyboardButton(text=button_text, callback_data=f"response_view:{item['rid']}")
-		])
-	buttons.append([InlineKeyboardButton(text="➕ Добавить триггер", callback_data="response_add_start")])
-	buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="set_answer")])
+	if has_responses:
+		buttons.append([InlineKeyboardButton(text="Скачать список .txt", callback_data="response_export_txt")])
+		buttons.append([InlineKeyboardButton(text="Все триггеры в AI-режим", callback_data="response_all_ai_confirm")])
+		buttons.append([InlineKeyboardButton(text="Удалить все триггеры", callback_data="response_delete_all_confirm")])
+	buttons.append([InlineKeyboardButton(text="Добавить / обновить триггер", callback_data="response_add_start")])
+	buttons.append([InlineKeyboardButton(text="Назад", callback_data="set_answer")])
 	return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def _response_detail_keyboard(response_id: int) -> InlineKeyboardMarkup:
 	return InlineKeyboardMarkup(inline_keyboard=[
-		[InlineKeyboardButton(text="✏️ Изменить текст", callback_data=f"response_edit_text:{response_id}")],
-		[InlineKeyboardButton(text="🤖 Переключить в AI-режим", callback_data=f"response_set_ai:{response_id}")],
-		[InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"response_delete_confirm:{response_id}")],
-		[InlineKeyboardButton(text="⬅️ К списку", callback_data="response_list")]
+		[InlineKeyboardButton(text="Изменить текст", callback_data=f"response_edit_text:{response_id}")],
+		[InlineKeyboardButton(text="Переключить в AI-режим", callback_data=f"response_set_ai:{response_id}")],
+		[InlineKeyboardButton(text="Удалить", callback_data=f"response_delete_confirm:{response_id}")],
+		[InlineKeyboardButton(text="К списку", callback_data="response_list")]
 	])
 
 
@@ -135,6 +194,15 @@ async def cb_set_answer(callback: CallbackQuery, state: FSMContext):
 	await state.clear()
 	await callback.message.edit_text(_responses_menu_text(), reply_markup=responses_menu_keyboard())
 	await callback.answer()
+
+
+@dp.message(Command("responses"))
+async def cmd_responses(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	await state.clear()
+	await message.answer(_responses_menu_text(), reply_markup=responses_menu_keyboard())
 
 
 @dp.callback_query(F.data == "response_add_start")
@@ -163,19 +231,92 @@ async def cb_response_list(callback: CallbackQuery, state: FSMContext):
 	if not responses:
 		await callback.message.edit_text(
 			"<b>Список триггеров</b>\n\nПока нет ни одного триггера.",
-			reply_markup=_responses_list_keyboard()
+			reply_markup=_responses_list_keyboard(has_responses=False)
 		)
 	else:
-		lines = ["<b>Список триггеров</b>", ""]
-		for item in responses[:40]:
-			lines.append(
-				f"- <code>{html.escape(item['keyword'])}</code> "
-				f"({html.escape(_response_type_label(item['response_type']))})"
-			)
-		if len(responses) > 40:
-			lines.append(f"\n...и еще {len(responses) - 40}")
-		await callback.message.edit_text("\n".join(lines), reply_markup=_responses_list_keyboard())
+		total, ai_count, text_count = _response_stats(responses)
+		await callback.message.edit_text(
+			"<b>Список триггеров</b>\n\n"
+			f"Всего: <b>{total}</b>\n"
+			f"AI-ответов: <b>{ai_count}</b>\n"
+			f"Готовых текстов: <b>{text_count}</b>\n\n"
+			"Полный список отправляю отдельным .txt файлом.",
+			reply_markup=_responses_list_keyboard(has_responses=True)
+		)
+		await _send_responses_file(callback.message, responses)
 	await callback.answer()
+
+
+@dp.callback_query(F.data == "response_export_txt")
+async def cb_response_export_txt(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	responses = _fetch_responses()
+	if not responses:
+		await callback.answer("Список пуст.", show_alert=True)
+		return
+	await _send_responses_file(callback.message, responses)
+	await callback.answer("Файл отправлен.")
+
+
+@dp.callback_query(F.data == "response_all_ai_confirm")
+async def cb_response_all_ai_confirm(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	keyboard = InlineKeyboardMarkup(inline_keyboard=[
+		[InlineKeyboardButton(text="Да, включить AI для всех", callback_data="response_all_ai")],
+		[InlineKeyboardButton(text="Отмена", callback_data="response_list")]
+	])
+	await callback.message.edit_text(
+		"Перевести все триггеры в AI-режим?\n\n"
+		"Готовые тексты у этих триггеров будут очищены.",
+		reply_markup=keyboard
+	)
+	await callback.answer()
+
+
+@dp.callback_query(F.data == "response_all_ai")
+async def cb_response_all_ai(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	updated = _set_all_responses_ai()
+	await callback.answer(f"Обновлено: {updated}")
+	await cb_response_list(callback, state)
+
+
+@dp.callback_query(F.data == "response_delete_all_confirm")
+async def cb_response_delete_all_confirm(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	keyboard = InlineKeyboardMarkup(inline_keyboard=[
+		[InlineKeyboardButton(text="Да, удалить все", callback_data="response_delete_all")],
+		[InlineKeyboardButton(text="Отмена", callback_data="response_list")]
+	])
+	await callback.message.edit_text(
+		"Удалить все триггеры?\n\n"
+		"Это действие нельзя отменить.",
+		reply_markup=keyboard
+	)
+	await callback.answer()
+
+
+@dp.callback_query(F.data == "response_delete_all")
+async def cb_response_delete_all(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	deleted = _delete_all_responses()
+	await callback.answer(f"Удалено: {deleted}")
+	await cb_response_list(callback, state)
 
 
 @dp.callback_query(F.data.startswith("response_view:"))
@@ -212,9 +353,9 @@ async def handle_keyword_input(message: Message, state: FSMContext):
 		return
 	await state.update_data(keyword=keyword)
 	keyboard = InlineKeyboardMarkup(inline_keyboard=[
-		[InlineKeyboardButton(text="💬 Готовый текст", callback_data="choice_predefined")],
-		[InlineKeyboardButton(text="🤖 AI-генерация", callback_data="choice_openai")],
-		[InlineKeyboardButton(text="❌ Отмена", callback_data="set_answer")]
+		[InlineKeyboardButton(text="Готовый текст", callback_data="choice_predefined")],
+		[InlineKeyboardButton(text="AI-генерация", callback_data="choice_openai")],
+		[InlineKeyboardButton(text="Отмена", callback_data="set_answer")]
 	])
 	await message.answer(f"Триггер: <b>{html.escape(keyword)}</b>\nВыбери тип ответа:", reply_markup=keyboard)
 
@@ -249,7 +390,7 @@ async def handle_predefined_text(message: Message, state: FSMContext):
 	_save_response(keyword, predefined_answer, "predefined")
 	await state.clear()
 	await message.answer(
-		f"✅ Триггер сохранен.\n\n"
+		f"Триггер сохранен.\n\n"
 		f"<b>Ключ:</b> <code>{html.escape(keyword)}</code>\n"
 		f"<b>Ответ:</b>\n<pre>{html.escape(predefined_answer)}</pre>",
 		reply_markup=responses_menu_keyboard()
@@ -264,15 +405,17 @@ async def cb_choice_openai(callback: CallbackQuery, state: FSMContext):
 	data = await state.get_data()
 	keyword = data.get("keyword")
 	if not keyword:
-		await callback.message.edit_text("Ключевое слово не найдено. Начните заново /start",
-										 reply_markup=main_menu_keyboard())
+		await callback.message.edit_text(
+			"Ключевое слово не найдено. Начните заново /start",
+			reply_markup=main_menu_keyboard()
+		)
 		await state.clear()
 		return
 
 	_save_response(keyword, "", "openai")
 	await state.clear()
 	await callback.message.edit_text(
-		f"✅ Триггер сохранен.\n\n"
+		f"Триггер сохранен.\n\n"
 		f"<b>Ключ:</b> <code>{html.escape(keyword)}</code>\n"
 		"При обнаружении будет генерироваться AI-ответ.",
 		reply_markup=responses_menu_keyboard()
