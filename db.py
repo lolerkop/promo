@@ -21,6 +21,7 @@ DB_MIGRATIONS = (
 	(2, "openai_only_provider"),
 	(3, "account_entity_memberships"),
 	(4, "telegram_api_credentials"),
+	(5, "advanced_triggers"),
 )
 _current_workspace_id = contextvars.ContextVar("current_workspace_id", default=None)
 
@@ -436,6 +437,34 @@ def create_tables():
 	""")
 
 	c.execute("""
+	CREATE TABLE IF NOT EXISTS trigger_intents (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT UNIQUE NOT NULL,
+		description TEXT,
+		response_type TEXT NOT NULL DEFAULT 'openai',
+		answer TEXT,
+		is_active INTEGER DEFAULT 1,
+		semantic_enabled INTEGER DEFAULT 1,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)
+	""")
+
+	c.execute("""
+	CREATE TABLE IF NOT EXISTS trigger_intent_phrases (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		intent_id INTEGER NOT NULL,
+		phrase TEXT NOT NULL,
+		match_type TEXT NOT NULL DEFAULT 'phrase',
+		is_active INTEGER DEFAULT 1,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		UNIQUE(intent_id, phrase),
+		FOREIGN KEY (intent_id) REFERENCES trigger_intents(id) ON DELETE CASCADE
+	)
+	""")
+
+	c.execute("""
 	CREATE TABLE IF NOT EXISTS templates (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		templates TEXT NOT NULL
@@ -601,12 +630,65 @@ def _migration_telegram_api_credentials(cursor):
 	)
 
 
+def _migration_advanced_triggers(cursor):
+	now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+	cursor.execute("""
+		CREATE TABLE IF NOT EXISTS trigger_intents (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT UNIQUE NOT NULL,
+			description TEXT,
+			response_type TEXT NOT NULL DEFAULT 'openai',
+			answer TEXT,
+			is_active INTEGER DEFAULT 1,
+			semantic_enabled INTEGER DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)
+	""")
+	cursor.execute("""
+		CREATE TABLE IF NOT EXISTS trigger_intent_phrases (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			intent_id INTEGER NOT NULL,
+			phrase TEXT NOT NULL,
+			match_type TEXT NOT NULL DEFAULT 'phrase',
+			is_active INTEGER DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			UNIQUE(intent_id, phrase),
+			FOREIGN KEY (intent_id) REFERENCES trigger_intents(id) ON DELETE CASCADE
+		)
+	""")
+	cursor.execute("CREATE INDEX IF NOT EXISTS idx_trigger_intents_active ON trigger_intents(is_active, semantic_enabled)")
+	cursor.execute("CREATE INDEX IF NOT EXISTS idx_trigger_intent_phrases_intent ON trigger_intent_phrases(intent_id, is_active)")
+	cursor.execute("""
+		INSERT OR IGNORE INTO trigger_intents (
+			name, description, response_type, answer, is_active, semantic_enabled, created_at, updated_at
+		) VALUES (?, ?, 'openai', '', 1, 1, ?, ?)
+	""", (
+		"нужен VPN",
+		"Пользователь прямо или косвенно просит VPN, обход блокировок или способ открыть сервис.",
+		now,
+		now,
+	))
+	cursor.execute("""
+		INSERT OR IGNORE INTO trigger_intents (
+			name, description, response_type, answer, is_active, semantic_enabled, created_at, updated_at
+		) VALUES (?, ?, 'openai', '', 1, 1, ?, ?)
+	""", (
+		"плохо работает связь",
+		"Пользователь жалуется на связь, интернет, глушилки, нестабильную сеть или недоступность сервисов.",
+		now,
+		now,
+	))
+
+
 def run_migrations():
 	migration_handlers = {
 		1: _migration_runtime_indexes,
 		2: _migration_openai_only_provider,
 		3: _migration_account_entity_memberships,
 		4: _migration_telegram_api_credentials,
+		5: _migration_advanced_triggers,
 	}
 	conn = get_db_connection()
 	c = conn.cursor()

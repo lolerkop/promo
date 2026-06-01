@@ -37,6 +37,8 @@ from services.proxy_repository import (get_account_proxy_block_reason,
 from services.rotation import (get_accounts_ordered_for_cycle as rotation_get_accounts_ordered_for_cycle,
                                get_next_account_in_cycle as rotation_get_next_account_in_cycle,
                                record_account_cycle_success as rotation_record_account_cycle_success)
+from services.trigger_engine import (evaluate_trigger_for_message,
+                                     record_trigger_delivery)
 from services.trigger_matching import (chat_id_variants as trigger_chat_id_variants,
                                        linked_chat_peer_from_db,
                                        matching_keyword_from_rows,
@@ -615,93 +617,85 @@ async def on_new_message_handler(event, client_obj, client_data):
 						conn.close()
 						return
 				
-				if is_in_active_category_for_account and category_name_for_chat:
-						category_specific_keywords = get_category_keywords(category_name_for_chat)
-						text_lower = event.raw_text.lower()
-						for r_cat_config in category_specific_keywords:
-								keyword_cat_db = r_cat_config["keyword"].lower()
-								if keyword_cat_db in text_lower:
-										logging.info(
-												f"ON_NEW_MESSAGE: Найдено ключевое слово категории '{keyword_cat_db}' ({category_name_for_chat}) аккаунтом {account_label}")
-										action_details_str_cat = f"category_keyword_reply:{category_name_for_chat}:{keyword_cat_db}"
-										ans_text_cat = ""                    
-										if r_cat_config["response_type"] == "predefined":
-												ans_text_cat = r_cat_config["answer"]
-										elif r_cat_config["response_type"] == "openai":
-												ans_text_cat = await asyncio.to_thread(
-														generate_vpn_comment,
-														context=event.raw_text,
-														current_account_id_for_log=account_db_id,
-														chat_id_for_prompt=chat_id,
-														generation_mode="trigger",
-												)
+				manually_added_group = None
+				if chat_id_variants:
+						cursor.execute(
+								f"SELECT id FROM groups WHERE id IN ({_sql_placeholders(chat_id_variants)}) AND enabled = 1 LIMIT 1",
+								chat_id_variants
+						)
+						manually_added_group = cursor.fetchone()
 
-										await send_rotating_chat_reply(
+				listen_all_enabled = get_config_value("listen_all", "True").lower() == "true"
+				should_be_active_in_chat = manually_added_group or is_in_active_category_for_account or listen_all_enabled
+				can_check_global_keywords = bool(should_be_active_in_chat)
+				allow_semantic = bool(manually_added_group or is_in_active_category_for_account)
+
+				if can_check_global_keywords:
+						decision = await asyncio.to_thread(
+								evaluate_trigger_for_message,
+								event.raw_text,
+								chat_id,
+								sender_id,
+								category_name_for_chat if is_in_active_category_for_account else None,
+								can_check_global_keywords,
+								allow_semantic,
+								True,
+						)
+						if decision.matched:
+								logging.info(
+										"ON_NEW_MESSAGE: trigger matched source=%s type=%s keyword=%s intent=%s confidence=%.2f account=%s",
+										decision.source,
+										decision.match_type,
+										decision.keyword,
+										decision.intent_name,
+										decision.confidence,
+										account_label,
+								)
+								response_text = ""
+								if decision.response_type == "predefined":
+										response_text = decision.answer
+								elif decision.response_type == "openai":
+										response_text = await asyncio.to_thread(
+												generate_vpn_comment,
+												context=event.raw_text,
+												current_account_id_for_log=account_db_id,
+												chat_id_for_prompt=chat_id if decision.source == "category" else None,
+												generation_mode="trigger",
+										)
+
+								if response_text and not response_text.lower().startswith("ошибка ai:"):
+										sent = await send_rotating_chat_reply(
 												event,
-												ans_text_cat,
+												response_text,
 												sender_id,
 												cycle_name=f"trigger_reply_chat_{chat_id}",
-												action_details=action_details_str_cat,
+												action_details=decision.action_details,
 												coordinator_account_id=account_db_id,
 												coordinator_label=account_label,
 										)
-										processed_by_keyword = True
-										break
-
-				if not processed_by_keyword:
-						manually_added_group = None
-						if chat_id_variants:
-								cursor.execute(
-										f"SELECT id FROM groups WHERE id IN ({_sql_placeholders(chat_id_variants)}) AND enabled = 1 LIMIT 1",
-										chat_id_variants
-								)
-								manually_added_group = cursor.fetchone()
-
-						listen_all_enabled = get_config_value("listen_all", "True").lower() == "true"
-						should_be_active_in_chat = manually_added_group or is_in_active_category_for_account or listen_all_enabled
-						can_check_global_keywords = should_be_active_in_chat
-						cursor.execute("SELECT keyword, answer, response_type FROM responses")
-						global_responses = cursor.fetchall()
-
-						if can_check_global_keywords:
-								text_lower_global = event.raw_text.lower()
-
-								for r_config in global_responses:
-										keyword_from_db = r_config["keyword"].lower()
-										if keyword_from_db in text_lower_global:
-												logging.info(
-														f"ON_NEW_MESSAGE: Найдено глобальное ключевое слово '{keyword_from_db}' аккаунтом {account_label}")
-												action_details_str = f"keyword_reply:{keyword_from_db}"
-												ans_text_to_send = ""
-												if r_config["response_type"] == "predefined":
-														ans_text_to_send = r_config["answer"]
-												elif r_config["response_type"] == "openai":
-														ans_text_to_send = await asyncio.to_thread(
-																generate_vpn_comment,
-																context=event.raw_text,
-																current_account_id_for_log=account_db_id,
-																chat_id_for_prompt=None,
-																generation_mode="trigger",
-														)
-
-												await send_rotating_chat_reply(
-														event,
-														ans_text_to_send,
-														sender_id,
-														cycle_name=f"trigger_reply_chat_{chat_id}",
-														action_details=action_details_str,
-														coordinator_account_id=account_db_id,
-														coordinator_label=account_label,
-												)
-												processed_by_keyword = True
-												break
-						else:
-								inactive_keyword = _matching_global_keyword_from_rows(global_responses, event.raw_text)
-								if inactive_keyword:
-										logging.info(
-												"ON_NEW_MESSAGE: keyword '%s' ignored in chat %s because listen_all=False and the group/category is not enabled.",
-												inactive_keyword, chat_id
+										if sent:
+												record_trigger_delivery(chat_id, sender_id, decision.cooldown_key)
+								else:
+										logging.warning(
+												"ON_NEW_MESSAGE: trigger matched but response text is empty/error. source=%s keyword=%s intent=%s",
+												decision.source,
+												decision.keyword,
+												decision.intent_name,
 										)
+								processed_by_keyword = True
+						elif decision.reason not in ("no_local_match", "semantic_disabled", "semantic_no_match"):
+								logging.debug(
+										"ON_NEW_MESSAGE: trigger skipped in chat %s. reason=%s",
+										chat_id,
+										decision.reason,
+								)
+				else:
+						inactive_keyword = _matching_global_keyword_from_db(event.raw_text)
+						if inactive_keyword:
+								logging.info(
+										"ON_NEW_MESSAGE: keyword '%s' ignored in chat %s because listen_all=False and the group/category is not enabled.",
+										inactive_keyword, chat_id
+								)
 				conn.close()
 
 		except Exception as e:

@@ -18,6 +18,22 @@ from ..keyboards import cancel_action_keyboard, main_menu_keyboard
 from ..prompt_files import read_prompt_document, send_prompt_preview_file
 from ..utils import user_is_allowed
 from services.prompt_text import PromptTextError
+from services.trigger_engine import (
+	build_full_trigger_export_text,
+	delete_intent_phrase,
+	delete_trigger_intent,
+	ensure_default_vpn_intents,
+	evaluate_trigger_for_message,
+	fetch_trigger_intents,
+	get_intent_phrase,
+	get_trigger_intent,
+	import_global_triggers_from_text,
+	semantic_analysis_enabled,
+	set_trigger_semantic_enabled,
+	update_trigger_intent,
+	upsert_trigger_intent,
+	add_intent_phrases,
+)
 
 
 DEFAULT_TRIGGER_AI_PROMPT = (
@@ -134,26 +150,64 @@ def _get_trigger_ai_max_tokens() -> str:
 	return get_config_value("ai_trigger_max_tokens", DEFAULT_TRIGGER_AI_MAX_TOKENS)
 
 
+def _get_semantic_threshold() -> str:
+	return get_config_value("trigger_semantic_threshold", "0.72")
+
+
+def _get_semantic_model() -> str:
+	return get_config_value("trigger_semantic_model", _get_trigger_ai_model())
+
+
+def _get_semantic_rate_limit() -> str:
+	return get_config_value("trigger_semantic_max_per_minute", "30")
+
+
+def _get_chat_cooldown() -> str:
+	return get_config_value("trigger_chat_cooldown_seconds", "120")
+
+
+def _get_user_cooldown() -> str:
+	return get_config_value("trigger_user_cooldown_seconds", "300")
+
+
 def _trigger_ai_settings_text() -> str:
 	prompt = _get_trigger_ai_prompt()
+	semantic_status = "включен" if semantic_analysis_enabled() else "выключен"
 	return (
 		"<b>AI-настройки триггеров</b>\n\n"
 		f"Модель: <code>{html.escape(_get_trigger_ai_model())}</code>\n"
 		f"Температура: <b>{html.escape(_get_trigger_ai_temperature())}</b>\n"
 		f"Макс. токены: <b>{html.escape(_get_trigger_ai_max_tokens())}</b>\n"
 		f"Промпт: <b>{len(prompt)}</b> симв.\n\n"
+		"<b>AI-анализ смысла</b>\n"
+		f"Статус: <b>{semantic_status}</b>\n"
+		f"Модель классификации: <code>{html.escape(_get_semantic_model())}</code>\n"
+		f"Порог уверенности: <b>{html.escape(_get_semantic_threshold())}</b>\n"
+		f"Проверок в минуту: <b>{html.escape(_get_semantic_rate_limit())}</b>\n"
+		f"Cooldown чата: <b>{html.escape(_get_chat_cooldown())}</b> сек.\n"
+		f"Cooldown пользователя: <b>{html.escape(_get_user_cooldown())}</b> сек.\n\n"
 		"Эти настройки используются только для ответов на триггеры. "
 		"Обычные автокомментарии и диалоги остаются на своих AI-настройках."
 	)
 
 
 def _trigger_ai_settings_keyboard() -> InlineKeyboardMarkup:
+	semantic_button = "Выключить AI-смысл" if semantic_analysis_enabled() else "Включить AI-смысл"
 	return InlineKeyboardMarkup(inline_keyboard=[
 		[InlineKeyboardButton(text="Промпт триггеров", callback_data="response_ai_prompt")],
 		[InlineKeyboardButton(text=f"Модель: {_get_trigger_ai_model()}", callback_data="response_ai_model")],
 		[
 			InlineKeyboardButton(text=f"Температура: {_get_trigger_ai_temperature()}", callback_data="response_ai_temperature"),
 			InlineKeyboardButton(text=f"Токены: {_get_trigger_ai_max_tokens()}", callback_data="response_ai_max_tokens"),
+		],
+		[InlineKeyboardButton(text=semantic_button, callback_data="response_semantic_toggle")],
+		[
+			InlineKeyboardButton(text=f"Порог: {_get_semantic_threshold()}", callback_data="response_semantic_threshold"),
+			InlineKeyboardButton(text=f"Классификатор: {_get_semantic_model()}", callback_data="response_semantic_model"),
+		],
+		[
+			InlineKeyboardButton(text=f"Лимит/мин: {_get_semantic_rate_limit()}", callback_data="response_semantic_rate"),
+			InlineKeyboardButton(text=f"Cooldown: {_get_chat_cooldown()}/{_get_user_cooldown()}", callback_data="response_cooldowns"),
 		],
 		[InlineKeyboardButton(text="Назад к триггерам", callback_data="set_answer")],
 	])
@@ -188,11 +242,160 @@ async def _send_responses_file(message: Message, responses: list[dict]) -> None:
 	)
 
 
+async def _send_full_triggers_file(message: Message) -> None:
+	document = BufferedInputFile(
+		build_full_trigger_export_text().encode("utf-8"),
+		filename="advanced_triggers.txt",
+	)
+	await message.answer_document(
+		document=document,
+		caption="Полный экспорт триггеров и намерений."
+	)
+
+
+def _intents_text() -> str:
+	intents = fetch_trigger_intents(include_phrases=True)
+	if not intents:
+		return "<b>Намерения</b>\n\nПока нет намерений."
+	lines = ["<b>Намерения</b>", ""]
+	for intent in intents[:30]:
+		status = "вкл" if int(intent.get("is_active") or 0) else "выкл"
+		semantic = "AI-смысл" if int(intent.get("semantic_enabled") or 0) else "без AI-смысла"
+		lines.append(
+			f"• <b>{html.escape(intent['name'])}</b> [{status}, {semantic}] - "
+			f"{len(intent.get('phrases', []))} фраз"
+		)
+	if len(intents) > 30:
+		lines.append(f"\n...и еще {len(intents) - 30}")
+	return "\n".join(lines)
+
+
+def _intents_keyboard() -> InlineKeyboardMarkup:
+	buttons = []
+	for intent in fetch_trigger_intents(include_phrases=False)[:25]:
+		status = "🟢" if int(intent.get("is_active") or 0) else "⚪"
+		semantic = "AI" if int(intent.get("semantic_enabled") or 0) else "ключи"
+		name = str(intent.get("name") or "Без названия")
+		if len(name) > 32:
+			name = name[:29] + "..."
+		buttons.append([
+			InlineKeyboardButton(
+				text=f"{status} {name} ({semantic})",
+				callback_data=f"response_intent_view:{intent['id']}",
+			)
+		])
+	buttons.extend([
+		[InlineKeyboardButton(text="Создать базовые VPN-намерения", callback_data="response_intents_defaults")],
+		[InlineKeyboardButton(text="Добавить намерение", callback_data="response_intent_add_start")],
+		[InlineKeyboardButton(text="Скачать полный .txt", callback_data="response_full_export_txt")],
+		[InlineKeyboardButton(text="Назад", callback_data="set_answer")],
+	])
+	return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _intent_detail_text(intent: dict) -> str:
+	status = "включено" if int(intent.get("is_active") or 0) else "выключено"
+	semantic = "включен" if int(intent.get("semantic_enabled") or 0) else "выключен"
+	response_type = _response_type_label(intent.get("response_type"))
+	answer = intent.get("answer") or ""
+	answer_text = "AI генерирует ответ по промпту триггеров."
+	if intent.get("response_type") == "predefined":
+		answer_text = answer or "-"
+	phrases = intent.get("phrases") or []
+	preview_phrases = "\n".join(f"• {html.escape(item['phrase'])}" for item in phrases[:12])
+	if len(phrases) > 12:
+		preview_phrases += f"\n...и еще {len(phrases) - 12}"
+	if not preview_phrases:
+		preview_phrases = "-"
+	return (
+		f"<b>Намерение:</b> {html.escape(intent.get('name') or '-')}\n"
+		f"<b>ID:</b> <code>{intent.get('id')}</code>\n"
+		f"<b>Статус:</b> {status}\n"
+		f"<b>AI-смысл:</b> {semantic}\n"
+		f"<b>Тип ответа:</b> {response_type}\n"
+		f"<b>Фраз:</b> {len(phrases)}\n\n"
+		f"<b>Описание:</b>\n{html.escape(intent.get('description') or '-')}\n\n"
+		f"<b>Ответ:</b>\n<pre>{html.escape(answer_text[:900])}</pre>\n\n"
+		f"<b>Фразы:</b>\n{preview_phrases}"
+	)
+
+
+def _intent_detail_keyboard(intent: dict) -> InlineKeyboardMarkup:
+	intent_id = intent["id"]
+	active_text = "Выключить намерение" if int(intent.get("is_active") or 0) else "Включить намерение"
+	semantic_text = "Выключить AI-смысл" if int(intent.get("semantic_enabled") or 0) else "Включить AI-смысл"
+	return InlineKeyboardMarkup(inline_keyboard=[
+		[
+			InlineKeyboardButton(text=active_text, callback_data=f"response_intent_toggle:{intent_id}"),
+			InlineKeyboardButton(text=semantic_text, callback_data=f"response_intent_toggle_semantic:{intent_id}"),
+		],
+		[
+			InlineKeyboardButton(text="Переименовать", callback_data=f"response_intent_rename_start:{intent_id}"),
+			InlineKeyboardButton(text="Описание", callback_data=f"response_intent_desc_start:{intent_id}"),
+		],
+		[
+			InlineKeyboardButton(text="Ответ: AI", callback_data=f"response_intent_set_ai:{intent_id}"),
+			InlineKeyboardButton(text="Ответ: текст", callback_data=f"response_intent_answer_start:{intent_id}"),
+		],
+		[
+			InlineKeyboardButton(text="Добавить фразы", callback_data=f"response_intent_add_phrases_start:{intent_id}"),
+			InlineKeyboardButton(text="Фразы/удаление", callback_data=f"response_intent_phrases:{intent_id}"),
+		],
+		[InlineKeyboardButton(text="Удалить намерение", callback_data=f"response_intent_delete_confirm:{intent_id}")],
+		[InlineKeyboardButton(text="К намерениям", callback_data="response_intents")],
+	])
+
+
+def _intent_phrases_text(intent: dict) -> str:
+	phrases = intent.get("phrases") or []
+	lines = [
+		f"<b>Фразы намерения:</b> {html.escape(intent.get('name') or '-')}",
+		f"Всего: <b>{len(phrases)}</b>",
+		"",
+		"Нажмите на фразу, чтобы удалить ее.",
+	]
+	for index, phrase in enumerate(phrases[:35], start=1):
+		lines.append(f"{index}. <code>{html.escape(phrase['phrase'])}</code>")
+	if len(phrases) > 35:
+		lines.append(f"\n...и еще {len(phrases) - 35}. Полный список есть в экспорте.")
+	return "\n".join(lines)
+
+
+def _intent_phrases_keyboard(intent: dict) -> InlineKeyboardMarkup:
+	intent_id = intent["id"]
+	buttons = []
+	for phrase in (intent.get("phrases") or [])[:35]:
+		label = str(phrase.get("phrase") or "")
+		if len(label) > 42:
+			label = label[:39] + "..."
+		buttons.append([
+			InlineKeyboardButton(
+				text=f"Удалить: {label}",
+				callback_data=f"response_intent_phrase_delete_confirm:{phrase['id']}:{intent_id}",
+			)
+		])
+	buttons.append([InlineKeyboardButton(text="Добавить фразы", callback_data=f"response_intent_add_phrases_start:{intent_id}")])
+	buttons.append([InlineKeyboardButton(text="Назад к намерению", callback_data=f"response_intent_view:{intent_id}")])
+	return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _import_export_keyboard() -> InlineKeyboardMarkup:
+	return InlineKeyboardMarkup(inline_keyboard=[
+		[InlineKeyboardButton(text="Импорт ключевых фраз .txt", callback_data="response_import_txt_start")],
+		[InlineKeyboardButton(text="Экспорт всего .txt", callback_data="response_full_export_txt")],
+		[InlineKeyboardButton(text="Назад", callback_data="set_answer")],
+	])
+
+
 def responses_menu_keyboard() -> InlineKeyboardMarkup:
 	return InlineKeyboardMarkup(inline_keyboard=[
-		[InlineKeyboardButton(text="Добавить / обновить триггер", callback_data="response_add_start")],
-		[InlineKeyboardButton(text="Список и общие настройки", callback_data="response_list")],
+		[InlineKeyboardButton(text="Намерения", callback_data="response_intents")],
+		[InlineKeyboardButton(text="Ключевые фразы", callback_data="response_list")],
 		[InlineKeyboardButton(text="AI-настройки триггеров", callback_data="response_ai_settings")],
+		[
+			InlineKeyboardButton(text="Импорт/экспорт .txt", callback_data="response_import_export"),
+			InlineKeyboardButton(text="Тест триггера", callback_data="response_test_start"),
+		],
 		[InlineKeyboardButton(text="Назад в главное меню", callback_data="back_to_main_menu")]
 	])
 
@@ -200,15 +403,18 @@ def responses_menu_keyboard() -> InlineKeyboardMarkup:
 def _responses_menu_text() -> str:
 	responses = _fetch_responses()
 	total, ai_count, text_count = _response_stats(responses)
+	intents = fetch_trigger_intents(include_phrases=True)
+	intent_phrases = sum(len(item.get("phrases", [])) for item in intents)
 	listen_all = get_config_value("listen_all", "True").lower() == "true"
 	tracking_text = "все чаты" if listen_all else "только включенные группы/категории из БД"
+	semantic_status = "включен" if semantic_analysis_enabled() else "выключен"
 	return (
 		"<b>Ответы на триггеры</b>\n\n"
-		f"Всего триггеров: <b>{total}</b>\n"
-		f"AI-ответов: <b>{ai_count}</b>\n"
-		f"Готовых текстов: <b>{text_count}</b>\n"
+		f"Ключевых фраз: <b>{total}</b> (AI: <b>{ai_count}</b>, текст: <b>{text_count}</b>)\n"
+		f"Намерений: <b>{len(intents)}</b>, фраз в намерениях: <b>{intent_phrases}</b>\n"
+		f"AI-анализ смысла: <b>{semantic_status}</b>\n"
 		f"Режим отслеживания: <b>{tracking_text}</b>\n\n"
-		"Когда аккаунт видит сообщение с ключевой фразой, он отвечает реплаем в этот чат."
+		"Сначала бот ищет локальные совпадения, потом при включенной настройке может проверить смысл сообщения через AI."
 	)
 
 
@@ -320,6 +526,588 @@ async def cb_response_export_txt(callback: CallbackQuery, state: FSMContext):
 	await callback.answer("Файл отправлен.")
 
 
+@dp.callback_query(F.data == "response_full_export_txt")
+async def cb_response_full_export_txt(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	await _send_full_triggers_file(callback.message)
+	await callback.answer("Файл отправлен.")
+
+
+@dp.callback_query(F.data == "response_import_export")
+async def cb_response_import_export(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	await callback.message.edit_text(
+		"<b>Импорт/экспорт триггеров</b>\n\n"
+		"Импорт .txt добавляет каждую непустую строку как глобальную ключевую фразу в AI-режиме.\n"
+		"Формат для готового текста: <code>фраза => ответ</code>.",
+		reply_markup=_import_export_keyboard()
+	)
+	await callback.answer()
+
+
+@dp.callback_query(F.data == "response_import_txt_start")
+async def cb_response_import_txt_start(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	await callback.message.edit_text(
+		"Отправьте .txt файл со списком фраз.\n\n"
+		"Каждая строка - отдельный триггер. Пустые строки и строки с # игнорируются.\n"
+		"Для готового ответа можно писать: <code>фраза => ответ</code>.",
+		reply_markup=cancel_action_keyboard()
+	)
+	await state.set_state("waiting_for_trigger_import_txt")
+	await callback.answer()
+
+
+@dp.message(StateFilter("waiting_for_trigger_import_txt"), F.document)
+async def handle_trigger_import_document(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	try:
+		text = await read_prompt_document(message.document)
+	except PromptTextError as exc:
+		await message.answer(f"Импорт не выполнен: {html.escape(str(exc))}", reply_markup=cancel_action_keyboard())
+		return
+	added, updated = import_global_triggers_from_text(text)
+	await state.clear()
+	await message.answer(
+		f"Импорт завершен.\nДобавлено: <b>{added}</b>\nОбновлено: <b>{updated}</b>",
+		reply_markup=responses_menu_keyboard()
+	)
+
+
+@dp.message(StateFilter("waiting_for_trigger_import_txt"), F.text, ~F.text.startswith('/'))
+async def handle_trigger_import_text(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	added, updated = import_global_triggers_from_text(message.text)
+	await state.clear()
+	await message.answer(
+		f"Импорт завершен.\nДобавлено: <b>{added}</b>\nОбновлено: <b>{updated}</b>",
+		reply_markup=responses_menu_keyboard()
+	)
+
+
+@dp.callback_query(F.data == "response_test_start")
+async def cb_response_test_start(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	await callback.message.edit_text(
+		"Отправьте пример сообщения из чата.\n\n"
+		"Бот покажет, какой триггер или смысловое намерение сработает. "
+		"Сообщение никуда отправляться не будет.",
+		reply_markup=cancel_action_keyboard()
+	)
+	await state.set_state("waiting_for_trigger_test_text")
+	await callback.answer()
+
+
+@dp.message(StateFilter("waiting_for_trigger_test_text"), F.text, ~F.text.startswith('/'))
+async def handle_trigger_test_text(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	decision = evaluate_trigger_for_message(
+		message.text,
+		chat_id=message.chat.id,
+		sender_id=message.from_user.id,
+		category_name=None,
+		allow_global=True,
+		allow_semantic=True,
+		respect_cooldown=False,
+	)
+	if not decision.matched:
+		text = (
+			"<b>Тест триггера</b>\n\n"
+			"Совпадение не найдено.\n"
+			f"Причина: <code>{html.escape(decision.reason or 'no_match')}</code>"
+		)
+	else:
+		answer_preview = decision.answer or "AI сгенерирует ответ по промпту триггеров."
+		text = (
+			"<b>Тест триггера</b>\n\n"
+			f"Источник: <b>{html.escape(decision.source)}</b>\n"
+			f"Тип совпадения: <b>{html.escape(decision.match_type)}</b>\n"
+			f"Ключ: <code>{html.escape(decision.keyword or '-')}</code>\n"
+			f"Намерение: <b>{html.escape(decision.intent_name or '-')}</b>\n"
+			f"Тип ответа: <b>{html.escape(decision.response_type or '-')}</b>\n"
+			f"Уверенность: <b>{decision.confidence:.2f}</b>\n"
+			f"Причина: <code>{html.escape(decision.reason or '-')}</code>\n\n"
+			f"<b>Ответ:</b>\n<pre>{html.escape(answer_preview[:800])}</pre>"
+		)
+	await state.clear()
+	await message.answer(text, reply_markup=responses_menu_keyboard())
+
+
+@dp.callback_query(F.data == "response_intents")
+async def cb_response_intents(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	await callback.message.edit_text(_intents_text(), reply_markup=_intents_keyboard())
+	await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("response_intent_view:"))
+async def cb_response_intent_view(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	try:
+		intent_id = int(callback.data.split(":", 1)[1])
+	except (ValueError, IndexError):
+		await callback.answer("Некорректный ID.", show_alert=True)
+		return
+	intent = get_trigger_intent(intent_id)
+	if not intent:
+		await callback.answer("Намерение не найдено.", show_alert=True)
+		await cb_response_intents(callback, state)
+		return
+	await callback.message.edit_text(_intent_detail_text(intent), reply_markup=_intent_detail_keyboard(intent))
+	await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("response_intent_toggle:"))
+async def cb_response_intent_toggle(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	try:
+		intent_id = int(callback.data.split(":", 1)[1])
+	except (ValueError, IndexError):
+		await callback.answer("Некорректный ID.", show_alert=True)
+		return
+	intent = get_trigger_intent(intent_id)
+	if not intent:
+		await callback.answer("Намерение не найдено.", show_alert=True)
+		return
+	updated = update_trigger_intent(intent_id, is_active=0 if int(intent.get("is_active") or 0) else 1)
+	await callback.message.edit_text(_intent_detail_text(updated), reply_markup=_intent_detail_keyboard(updated))
+	await callback.answer("Статус обновлен.")
+
+
+@dp.callback_query(F.data.startswith("response_intent_toggle_semantic:"))
+async def cb_response_intent_toggle_semantic(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	try:
+		intent_id = int(callback.data.split(":", 1)[1])
+	except (ValueError, IndexError):
+		await callback.answer("Некорректный ID.", show_alert=True)
+		return
+	intent = get_trigger_intent(intent_id)
+	if not intent:
+		await callback.answer("Намерение не найдено.", show_alert=True)
+		return
+	updated = update_trigger_intent(intent_id, semantic_enabled=0 if int(intent.get("semantic_enabled") or 0) else 1)
+	await callback.message.edit_text(_intent_detail_text(updated), reply_markup=_intent_detail_keyboard(updated))
+	await callback.answer("AI-смысл обновлен.")
+
+
+@dp.callback_query(F.data.startswith("response_intent_rename_start:"))
+async def cb_response_intent_rename_start(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	try:
+		intent_id = int(callback.data.split(":", 1)[1])
+	except (ValueError, IndexError):
+		await callback.answer("Некорректный ID.", show_alert=True)
+		return
+	intent = get_trigger_intent(intent_id, include_phrases=False)
+	if not intent:
+		await callback.answer("Намерение не найдено.", show_alert=True)
+		return
+	await state.update_data(intent_id=intent_id)
+	await callback.message.edit_text(
+		f"Текущее название: <b>{html.escape(intent.get('name') or '-')}</b>\n\nВведите новое название:",
+		reply_markup=cancel_action_keyboard(),
+	)
+	await state.set_state("waiting_for_intent_rename")
+	await callback.answer()
+
+
+@dp.message(StateFilter("waiting_for_intent_rename"), F.text, ~F.text.startswith('/'))
+async def handle_intent_rename(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	data = await state.get_data()
+	intent_id = data.get("intent_id")
+	name = message.text.strip()
+	if not intent_id or not name:
+		await message.answer("Название не может быть пустым.", reply_markup=cancel_action_keyboard())
+		return
+	try:
+		intent = update_trigger_intent(int(intent_id), name=name)
+	except Exception as exc:
+		await message.answer(f"Не удалось переименовать: {html.escape(str(exc))}", reply_markup=cancel_action_keyboard())
+		return
+	await state.clear()
+	await message.answer(_intent_detail_text(intent), reply_markup=_intent_detail_keyboard(intent))
+
+
+@dp.callback_query(F.data.startswith("response_intent_desc_start:"))
+async def cb_response_intent_desc_start(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	try:
+		intent_id = int(callback.data.split(":", 1)[1])
+	except (ValueError, IndexError):
+		await callback.answer("Некорректный ID.", show_alert=True)
+		return
+	intent = get_trigger_intent(intent_id, include_phrases=False)
+	if not intent:
+		await callback.answer("Намерение не найдено.", show_alert=True)
+		return
+	await state.update_data(intent_id=intent_id)
+	await callback.message.edit_text(
+		f"Текущее описание:\n<pre>{html.escape(intent.get('description') or '-')}</pre>\n\n"
+		"Введите новое описание смысла намерения. Для очистки отправьте <code>-</code>.",
+		reply_markup=cancel_action_keyboard(),
+	)
+	await state.set_state("waiting_for_intent_description_edit")
+	await callback.answer()
+
+
+@dp.message(StateFilter("waiting_for_intent_description_edit"), F.text, ~F.text.startswith('/'))
+async def handle_intent_description_edit(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	data = await state.get_data()
+	intent_id = data.get("intent_id")
+	description = "" if message.text.strip() == "-" else message.text.strip()
+	intent = update_trigger_intent(int(intent_id), description=description)
+	await state.clear()
+	await message.answer(_intent_detail_text(intent), reply_markup=_intent_detail_keyboard(intent))
+
+
+@dp.callback_query(F.data.startswith("response_intent_set_ai:"))
+async def cb_response_intent_set_ai(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	try:
+		intent_id = int(callback.data.split(":", 1)[1])
+	except (ValueError, IndexError):
+		await callback.answer("Некорректный ID.", show_alert=True)
+		return
+	intent = update_trigger_intent(intent_id, response_type="openai", answer="")
+	if not intent:
+		await callback.answer("Намерение не найдено.", show_alert=True)
+		return
+	await callback.message.edit_text(_intent_detail_text(intent), reply_markup=_intent_detail_keyboard(intent))
+	await callback.answer("Ответ переключен в AI.")
+
+
+@dp.callback_query(F.data.startswith("response_intent_answer_start:"))
+async def cb_response_intent_answer_start(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	try:
+		intent_id = int(callback.data.split(":", 1)[1])
+	except (ValueError, IndexError):
+		await callback.answer("Некорректный ID.", show_alert=True)
+		return
+	intent = get_trigger_intent(intent_id, include_phrases=False)
+	if not intent:
+		await callback.answer("Намерение не найдено.", show_alert=True)
+		return
+	await state.update_data(intent_id=intent_id)
+	await callback.message.edit_text(
+		"Введите готовый текст ответа для этого намерения.\n\n"
+		"После сохранения намерение будет отвечать этим текстом вместо AI-генерации.",
+		reply_markup=cancel_action_keyboard(),
+	)
+	await state.set_state("waiting_for_intent_answer")
+	await callback.answer()
+
+
+@dp.message(StateFilter("waiting_for_intent_answer"), F.text, ~F.text.startswith('/'))
+async def handle_intent_answer(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	data = await state.get_data()
+	intent_id = data.get("intent_id")
+	answer = message.text.strip()
+	if not answer:
+		await message.answer("Ответ не может быть пустым.", reply_markup=cancel_action_keyboard())
+		return
+	intent = update_trigger_intent(int(intent_id), response_type="predefined", answer=answer)
+	await state.clear()
+	await message.answer(_intent_detail_text(intent), reply_markup=_intent_detail_keyboard(intent))
+
+
+@dp.callback_query(F.data.startswith("response_intent_add_phrases_start:"))
+async def cb_response_intent_add_phrases_start(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	try:
+		intent_id = int(callback.data.split(":", 1)[1])
+	except (ValueError, IndexError):
+		await callback.answer("Некорректный ID.", show_alert=True)
+		return
+	intent = get_trigger_intent(intent_id, include_phrases=False)
+	if not intent:
+		await callback.answer("Намерение не найдено.", show_alert=True)
+		return
+	await state.update_data(intent_id=intent_id)
+	await callback.message.edit_text(
+		"Отправьте фразы для намерения: текстом или .txt файлом.\n\n"
+		"Каждая строка - отдельная фраза. Пустые строки и строки с # игнорируются.",
+		reply_markup=cancel_action_keyboard(),
+	)
+	await state.set_state("waiting_for_intent_add_phrases")
+	await callback.answer()
+
+
+def _parse_phrase_lines(text: str) -> list[str]:
+	return [line.strip() for line in (text or "").splitlines() if line.strip() and not line.strip().startswith("#")]
+
+
+async def _save_intent_phrases_from_text(message: Message, state: FSMContext, text: str):
+	data = await state.get_data()
+	intent_id = data.get("intent_id")
+	if not intent_id:
+		await message.answer("Намерение не найдено. Начните заново.", reply_markup=responses_menu_keyboard())
+		await state.clear()
+		return
+	phrases = _parse_phrase_lines(text)
+	if not phrases:
+		await message.answer("Фразы не найдены.", reply_markup=cancel_action_keyboard())
+		return
+	added = add_intent_phrases(int(intent_id), phrases)
+	intent = get_trigger_intent(int(intent_id))
+	await state.clear()
+	await message.answer(
+		f"Фразы обработаны: <b>{len(phrases)}</b>\nДобавлено новых: <b>{added}</b>\n\n"
+		+ _intent_detail_text(intent),
+		reply_markup=_intent_detail_keyboard(intent),
+	)
+
+
+@dp.message(StateFilter("waiting_for_intent_add_phrases"), F.text, ~F.text.startswith('/'))
+async def handle_intent_add_phrases_text(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	await _save_intent_phrases_from_text(message, state, message.text)
+
+
+@dp.message(StateFilter("waiting_for_intent_add_phrases"), F.document)
+async def handle_intent_add_phrases_document(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	try:
+		text = await read_prompt_document(message.document)
+	except PromptTextError as exc:
+		await message.answer(f"Фразы не добавлены: {html.escape(str(exc))}", reply_markup=cancel_action_keyboard())
+		return
+	await _save_intent_phrases_from_text(message, state, text)
+
+
+@dp.callback_query(F.data.startswith("response_intent_phrases:"))
+async def cb_response_intent_phrases(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	try:
+		intent_id = int(callback.data.split(":", 1)[1])
+	except (ValueError, IndexError):
+		await callback.answer("Некорректный ID.", show_alert=True)
+		return
+	intent = get_trigger_intent(intent_id)
+	if not intent:
+		await callback.answer("Намерение не найдено.", show_alert=True)
+		return
+	await callback.message.edit_text(_intent_phrases_text(intent), reply_markup=_intent_phrases_keyboard(intent))
+	await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("response_intent_phrase_delete_confirm:"))
+async def cb_response_intent_phrase_delete_confirm(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	try:
+		_, phrase_id, intent_id = callback.data.split(":", 2)
+		phrase_id = int(phrase_id)
+		intent_id = int(intent_id)
+	except (ValueError, IndexError):
+		await callback.answer("Некорректный ID.", show_alert=True)
+		return
+	phrase = get_intent_phrase(phrase_id)
+	if not phrase:
+		await callback.answer("Фраза не найдена.", show_alert=True)
+		return
+	keyboard = InlineKeyboardMarkup(inline_keyboard=[
+		[InlineKeyboardButton(text="Да, удалить", callback_data=f"response_intent_phrase_delete:{phrase_id}:{intent_id}")],
+		[InlineKeyboardButton(text="Отмена", callback_data=f"response_intent_phrases:{intent_id}")],
+	])
+	await callback.message.edit_text(
+		f"Удалить фразу?\n\n<code>{html.escape(phrase.get('phrase') or '')}</code>",
+		reply_markup=keyboard,
+	)
+	await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("response_intent_phrase_delete:"))
+async def cb_response_intent_phrase_delete(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	try:
+		_, phrase_id, intent_id = callback.data.split(":", 2)
+		phrase_id = int(phrase_id)
+		intent_id = int(intent_id)
+	except (ValueError, IndexError):
+		await callback.answer("Некорректный ID.", show_alert=True)
+		return
+	delete_intent_phrase(phrase_id)
+	intent = get_trigger_intent(intent_id)
+	if not intent:
+		await callback.answer("Фраза удалена.")
+		await cb_response_intents(callback, state)
+		return
+	await callback.message.edit_text(_intent_phrases_text(intent), reply_markup=_intent_phrases_keyboard(intent))
+	await callback.answer("Фраза удалена.")
+
+
+@dp.callback_query(F.data.startswith("response_intent_delete_confirm:"))
+async def cb_response_intent_delete_confirm(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	try:
+		intent_id = int(callback.data.split(":", 1)[1])
+	except (ValueError, IndexError):
+		await callback.answer("Некорректный ID.", show_alert=True)
+		return
+	intent = get_trigger_intent(intent_id, include_phrases=False)
+	if not intent:
+		await callback.answer("Намерение не найдено.", show_alert=True)
+		return
+	keyboard = InlineKeyboardMarkup(inline_keyboard=[
+		[InlineKeyboardButton(text="Да, удалить", callback_data=f"response_intent_delete:{intent_id}")],
+		[InlineKeyboardButton(text="Отмена", callback_data=f"response_intent_view:{intent_id}")],
+	])
+	await callback.message.edit_text(
+		f"Удалить намерение <b>{html.escape(intent.get('name') or '-')}</b>?\n\n"
+		"Все его фразы тоже будут удалены.",
+		reply_markup=keyboard,
+	)
+	await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("response_intent_delete:"))
+async def cb_response_intent_delete(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	try:
+		intent_id = int(callback.data.split(":", 1)[1])
+	except (ValueError, IndexError):
+		await callback.answer("Некорректный ID.", show_alert=True)
+		return
+	deleted = delete_trigger_intent(intent_id)
+	await callback.answer("Удалено." if deleted else "Не найдено.")
+	await cb_response_intents(callback, state)
+
+
+@dp.callback_query(F.data == "response_intents_defaults")
+async def cb_response_intents_defaults(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	count = ensure_default_vpn_intents()
+	await callback.answer(f"Готово: {count}")
+	await callback.message.edit_text(_intents_text(), reply_markup=_intents_keyboard())
+
+
+@dp.callback_query(F.data == "response_intent_add_start")
+async def cb_response_intent_add_start(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await state.clear()
+	await callback.message.edit_text("Введите название намерения:", reply_markup=cancel_action_keyboard())
+	await state.set_state("waiting_for_intent_name")
+	await callback.answer()
+
+
+@dp.message(StateFilter("waiting_for_intent_name"), F.text, ~F.text.startswith('/'))
+async def handle_intent_name(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	name = message.text.strip()
+	if not name:
+		await message.answer("Название не может быть пустым.", reply_markup=cancel_action_keyboard())
+		return
+	await state.update_data(intent_name=name)
+	await message.answer("Введите описание смысла намерения:", reply_markup=cancel_action_keyboard())
+	await state.set_state("waiting_for_intent_description")
+
+
+@dp.message(StateFilter("waiting_for_intent_description"), F.text, ~F.text.startswith('/'))
+async def handle_intent_description(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	await state.update_data(intent_description=message.text.strip())
+	await message.answer(
+		"Введите ключевые фразы для этого намерения, каждую с новой строки.\n"
+		"Если нужны только смысловые AI-срабатывания, отправьте <code>-</code>.",
+		reply_markup=cancel_action_keyboard()
+	)
+	await state.set_state("waiting_for_intent_phrases")
+
+
+@dp.message(StateFilter("waiting_for_intent_phrases"), F.text, ~F.text.startswith('/'))
+async def handle_intent_phrases(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	data = await state.get_data()
+	name = data.get("intent_name")
+	description = data.get("intent_description", "")
+	intent_id = upsert_trigger_intent(name, description, "openai", "", 1, 1)
+	phrases = []
+	if message.text.strip() != "-":
+		phrases = [line.strip() for line in message.text.splitlines() if line.strip()]
+	added = add_intent_phrases(intent_id, phrases) if phrases else 0
+	await state.clear()
+	await message.answer(
+		f"Намерение сохранено.\n"
+		f"Название: <b>{html.escape(name)}</b>\n"
+		f"Фраз добавлено: <b>{added}</b>",
+		reply_markup=_intents_keyboard()
+	)
+
+
 @dp.callback_query(F.data == "response_ai_settings")
 async def cb_response_ai_settings(callback: CallbackQuery, state: FSMContext):
 	if not user_is_allowed(callback.from_user.id):
@@ -395,6 +1183,77 @@ async def cb_response_ai_max_tokens(callback: CallbackQuery, state: FSMContext):
 		reply_markup=cancel_action_keyboard()
 	)
 	await state.set_state("waiting_for_trigger_ai_max_tokens")
+	await callback.answer()
+
+
+@dp.callback_query(F.data == "response_semantic_toggle")
+async def cb_response_semantic_toggle(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	set_trigger_semantic_enabled(not semantic_analysis_enabled())
+	await state.clear()
+	await callback.message.edit_text(
+		_trigger_ai_settings_text(),
+		reply_markup=_trigger_ai_settings_keyboard()
+	)
+	await callback.answer("Настройка обновлена.")
+
+
+@dp.callback_query(F.data == "response_semantic_threshold")
+async def cb_response_semantic_threshold(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await callback.message.edit_text(
+		f"Текущий порог уверенности: <code>{html.escape(_get_semantic_threshold())}</code>\n"
+		"Введите число от 0 до 1. Обычно норм: 0.70-0.80.",
+		reply_markup=cancel_action_keyboard()
+	)
+	await state.set_state("waiting_for_semantic_threshold")
+	await callback.answer()
+
+
+@dp.callback_query(F.data == "response_semantic_model")
+async def cb_response_semantic_model(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await callback.message.edit_text(
+		f"Текущая модель классификации: <code>{html.escape(_get_semantic_model())}</code>\n"
+		"Введите новую модель, например <code>gpt-4o-mini</code>.",
+		reply_markup=cancel_action_keyboard()
+	)
+	await state.set_state("waiting_for_semantic_model")
+	await callback.answer()
+
+
+@dp.callback_query(F.data == "response_semantic_rate")
+async def cb_response_semantic_rate(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await callback.message.edit_text(
+		f"Текущий лимит AI-проверок смысла в минуту: <code>{html.escape(_get_semantic_rate_limit())}</code>\n"
+		"Введите целое число. 0 полностью блокирует AI-классификацию.",
+		reply_markup=cancel_action_keyboard()
+	)
+	await state.set_state("waiting_for_semantic_rate")
+	await callback.answer()
+
+
+@dp.callback_query(F.data == "response_cooldowns")
+async def cb_response_cooldowns(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("У вас нет прав.")
+		return
+	await callback.message.edit_text(
+		f"Текущий cooldown чата: <code>{html.escape(_get_chat_cooldown())}</code> сек.\n"
+		f"Текущий cooldown пользователя: <code>{html.escape(_get_user_cooldown())}</code> сек.\n\n"
+		"Введите два числа через пробел: <code>120 300</code>.",
+		reply_markup=cancel_action_keyboard()
+	)
+	await state.set_state("waiting_for_trigger_cooldowns")
 	await callback.answer()
 
 
@@ -502,6 +1361,79 @@ async def handle_trigger_ai_max_tokens(message: Message, state: FSMContext):
 	set_config_value("ai_trigger_max_tokens", str(value))
 	await state.clear()
 	await message.answer("Лимит токенов AI для триггеров обновлен.", reply_markup=_trigger_ai_settings_keyboard())
+
+
+@dp.message(StateFilter("waiting_for_semantic_threshold"), F.text, ~F.text.startswith('/'))
+async def handle_semantic_threshold(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	try:
+		value = float(message.text.strip().replace(",", "."))
+	except ValueError:
+		await message.answer("Введите число, например 0.72.", reply_markup=cancel_action_keyboard())
+		return
+	if not 0 <= value <= 1:
+		await message.answer("Порог должен быть от 0 до 1.", reply_markup=cancel_action_keyboard())
+		return
+	set_config_value("trigger_semantic_threshold", str(value))
+	await state.clear()
+	await message.answer("Порог AI-смысла обновлен.", reply_markup=_trigger_ai_settings_keyboard())
+
+
+@dp.message(StateFilter("waiting_for_semantic_model"), F.text, ~F.text.startswith('/'))
+async def handle_semantic_model(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	model = message.text.strip()
+	if not model:
+		await message.answer("Модель не может быть пустой.", reply_markup=cancel_action_keyboard())
+		return
+	set_config_value("trigger_semantic_model", model)
+	await state.clear()
+	await message.answer("Модель классификации обновлена.", reply_markup=_trigger_ai_settings_keyboard())
+
+
+@dp.message(StateFilter("waiting_for_semantic_rate"), F.text, ~F.text.startswith('/'))
+async def handle_semantic_rate(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	try:
+		value = int(message.text.strip())
+	except ValueError:
+		await message.answer("Введите целое число, например 30.", reply_markup=cancel_action_keyboard())
+		return
+	if value < 0:
+		await message.answer("Лимит не может быть отрицательным.", reply_markup=cancel_action_keyboard())
+		return
+	set_config_value("trigger_semantic_max_per_minute", str(value))
+	await state.clear()
+	await message.answer("Лимит AI-проверок обновлен.", reply_markup=_trigger_ai_settings_keyboard())
+
+
+@dp.message(StateFilter("waiting_for_trigger_cooldowns"), F.text, ~F.text.startswith('/'))
+async def handle_trigger_cooldowns(message: Message, state: FSMContext):
+	if not user_is_allowed(message.from_user.id):
+		await message.answer("У вас нет прав.")
+		return
+	parts = message.text.replace(",", " ").split()
+	if len(parts) != 2:
+		await message.answer("Введите два числа через пробел, например: 120 300", reply_markup=cancel_action_keyboard())
+		return
+	try:
+		chat_cd, user_cd = int(parts[0]), int(parts[1])
+	except ValueError:
+		await message.answer("Оба значения должны быть целыми числами.", reply_markup=cancel_action_keyboard())
+		return
+	if chat_cd < 0 or user_cd < 0:
+		await message.answer("Cooldown не может быть отрицательным.", reply_markup=cancel_action_keyboard())
+		return
+	set_config_value("trigger_chat_cooldown_seconds", str(chat_cd))
+	set_config_value("trigger_user_cooldown_seconds", str(user_cd))
+	await state.clear()
+	await message.answer("Cooldown-ы обновлены.", reply_markup=_trigger_ai_settings_keyboard())
 
 
 @dp.callback_query(F.data == "response_all_ai")
