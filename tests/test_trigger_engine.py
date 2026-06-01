@@ -1,9 +1,12 @@
 import unittest
+from unittest.mock import patch
 
 from services.trigger_engine import (
 	TriggerDecision,
+	best_indirect_marker_match,
 	best_local_trigger_match,
 	compact_text,
+	evaluate_trigger_for_message,
 	normalize_text,
 )
 
@@ -67,6 +70,89 @@ class TriggerEngineTests(unittest.TestCase):
 		)
 		self.assertTrue(decision.matched)
 		self.assertEqual(decision.intent_name, "плохо работает связь")
+
+	def test_indirect_phrase_does_not_reply_directly(self):
+		decision = best_local_trigger_match(
+			"ютуб опять странно работает",
+			intent_phrase_rows=[
+				Row(
+					phrase="ютуб",
+					match_type="indirect",
+					intent_id=1,
+					intent_name="плохо работает связь",
+					answer="",
+					response_type="openai",
+				)
+			],
+		)
+		self.assertFalse(decision.matched)
+		self.assertEqual(decision.reason, "no_local_match")
+
+	def test_indirect_marker_match_is_detected(self):
+		decision = best_indirect_marker_match(
+			"ютуб опять странно работает",
+			intent_phrase_rows=[
+				Row(
+					phrase="ютуб",
+					match_type="indirect",
+					intent_id=1,
+					intent_name="плохо работает связь",
+					answer="",
+					response_type="openai",
+				)
+			],
+		)
+		self.assertFalse(decision.matched)
+		self.assertEqual(decision.indirect_keyword, "ютуб")
+		self.assertEqual(decision.reason, "indirect_marker_match")
+
+	def test_semantic_is_not_called_without_indirect_marker(self):
+		with patch("services.trigger_engine.fetch_category_keywords", return_value=[]), \
+			 patch("services.trigger_engine.fetch_global_responses", return_value=[]), \
+			 patch("services.trigger_engine.fetch_intent_phrase_rows", return_value=[]), \
+			 patch("services.trigger_engine.classify_semantic_intent") as classifier:
+			decision = evaluate_trigger_for_message(
+				"обычное сообщение без маркеров",
+				allow_global=True,
+				allow_semantic=True,
+				respect_cooldown=False,
+			)
+		classifier.assert_not_called()
+		self.assertFalse(decision.matched)
+		self.assertEqual(decision.reason, "no_indirect_marker")
+
+	def test_semantic_is_called_after_indirect_marker(self):
+		semantic_result = TriggerDecision(
+			matched=True,
+			source="semantic",
+			match_type="semantic",
+			intent_name="плохо работает связь",
+			response_type="openai",
+			confidence=0.9,
+			reason="semantic_match",
+		)
+		with patch("services.trigger_engine.fetch_category_keywords", return_value=[]), \
+			 patch("services.trigger_engine.fetch_global_responses", return_value=[]), \
+			 patch("services.trigger_engine.fetch_intent_phrase_rows", return_value=[
+				 Row(
+					 phrase="ютуб",
+					 match_type="indirect",
+					 intent_id=1,
+					 intent_name="плохо работает связь",
+					 answer="",
+					 response_type="openai",
+				 )
+			 ]), \
+			 patch("services.trigger_engine.classify_semantic_intent", return_value=semantic_result) as classifier:
+			decision = evaluate_trigger_for_message(
+				"ютуб опять странно работает",
+				allow_global=True,
+				allow_semantic=True,
+				respect_cooldown=False,
+			)
+		classifier.assert_called_once()
+		self.assertTrue(decision.matched)
+		self.assertEqual(decision.indirect_keyword, "ютуб")
 
 
 if __name__ == "__main__":

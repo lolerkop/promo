@@ -27,6 +27,7 @@ class TriggerDecision:
 	source: str = ""
 	match_type: str = ""
 	keyword: str | None = None
+	indirect_keyword: str | None = None
 	intent_id: int | None = None
 	intent_name: str | None = None
 	response_type: str | None = None
@@ -123,6 +124,14 @@ def _row_value(row: Any, key: str, default=None):
 	return default if value is None else value
 
 
+def is_direct_match_type(match_type: str | None) -> bool:
+	return (match_type or "phrase").strip().lower() in {"direct", "phrase", "keyword", ""}
+
+
+def is_indirect_match_type(match_type: str | None) -> bool:
+	return (match_type or "").strip().lower() == "indirect"
+
+
 def _candidate_decision(
 	row: Any,
 	source: str,
@@ -153,6 +162,35 @@ def _candidate_decision(
 	return _specificity_score(keyword, source_priority), decision
 
 
+def _match_candidate_rows(
+	rows: list[Any] | None,
+	normalized: str,
+	compacted: str,
+	source: str,
+	source_priority: int,
+	keyword_key: str,
+	match_type_filter=None,
+	category_name: str | None = None,
+) -> list[tuple[tuple[int, int, int], TriggerDecision]]:
+	candidates: list[tuple[tuple[int, int, int], TriggerDecision]] = []
+	for row in rows or []:
+		keyword = str(_row_value(row, keyword_key, "") or "")
+		match_type = str(_row_value(row, "match_type", "phrase") or "phrase")
+		if match_type_filter and not match_type_filter(match_type):
+			continue
+		if _phrase_matches_text(keyword, normalized, compacted):
+			candidates.append(
+				_candidate_decision(
+					row,
+					source,
+					source_priority,
+					keyword_key=keyword_key,
+					category_name=category_name,
+				)
+			)
+	return candidates
+
+
 def best_local_trigger_match(
 	message_text: str | None,
 	category_keywords: list[Any] | None = None,
@@ -172,13 +210,17 @@ def best_local_trigger_match(
 		if _phrase_matches_text(keyword, normalized, compacted):
 			candidates.append(_candidate_decision(row, "category", 300, category_name=category_name))
 
-	for row in intent_phrase_rows or []:
-		phrase = str(_row_value(row, "phrase", "") or "")
-		match_type = str(_row_value(row, "match_type", "phrase") or "phrase")
-		if match_type == "semantic":
-			continue
-		if _phrase_matches_text(phrase, normalized, compacted):
-			candidates.append(_candidate_decision(row, "intent_phrase", 200, keyword_key="phrase"))
+	candidates.extend(
+		_match_candidate_rows(
+			intent_phrase_rows,
+			normalized,
+			compacted,
+			"intent_phrase",
+			200,
+			"phrase",
+			match_type_filter=is_direct_match_type,
+		)
+	)
 
 	for row in global_responses or []:
 		keyword = str(_row_value(row, "keyword", "") or "")
@@ -190,6 +232,35 @@ def best_local_trigger_match(
 
 	candidates.sort(key=lambda item: item[0], reverse=True)
 	return candidates[0][1]
+
+
+def best_indirect_marker_match(
+	message_text: str | None,
+	intent_phrase_rows: list[Any] | None = None,
+) -> TriggerDecision:
+	normalized = normalize_text(message_text)
+	compacted = normalized.replace(" ", "")
+	if not normalized:
+		return TriggerDecision(reason="empty_message")
+
+	candidates = _match_candidate_rows(
+		intent_phrase_rows,
+		normalized,
+		compacted,
+		"indirect_marker",
+		50,
+		"phrase",
+		match_type_filter=is_indirect_match_type,
+	)
+	if not candidates:
+		return TriggerDecision(reason="no_indirect_marker")
+
+	candidates.sort(key=lambda item: item[0], reverse=True)
+	decision = candidates[0][1]
+	decision.matched = False
+	decision.indirect_keyword = decision.keyword
+	decision.reason = "indirect_marker_match"
+	return decision
 
 
 def fetch_category_keywords(category_name: str | None) -> list[dict]:
@@ -420,35 +491,49 @@ def ensure_default_vpn_intents() -> int:
 	defaults = {
 		"нужен VPN": {
 			"description": "Пользователь просит VPN, обход блокировок или способ открыть недоступный сервис.",
-			"phrases": [
+			"direct_phrases": [
 				"нужен vpn", "нужен впн", "какой vpn", "какой впн", "посоветуйте vpn",
 				"посоветуйте впн", "без vpn не открывается", "без впн не открывается",
 				"нужен нормальный vpn", "есть рабочий впн", "ищу vpn", "ищу впн",
-				"как зайти без блокировки", "чем открыть заблокированное",
+				"vpn не работает", "впн не работает", "как зайти без блокировки",
+				"чем открыть заблокированное",
+			],
+			"indirect_phrases": [
+				"vpn", "впн", "прокси", "proxy", "обход", "доступ",
 			],
 		},
 		"плохо работает связь": {
 			"description": "Пользователь жалуется на связь, интернет, глушилки, блокировки или недоступность сервисов.",
-			"phrases": [
+			"direct_phrases": [
 				"связь глушат", "интернет глушат", "опять связь", "плохо ловит",
 				"не работает интернет", "ютуб не открывается", "youtube не открывается",
 				"инста не открывается", "telegram тупит", "телеграм тупит",
 				"ничего не грузит", "сайты не открываются", "сервисы не работают",
 			],
+			"indirect_phrases": [
+				"ютуб", "youtube", "тг", "telegram", "телеграм", "тик ток", "tiktok",
+				"instagram", "инста", "связь", "интернет", "глушилки",
+			],
 		},
 		"блокировки сервисов": {
 			"description": "Пользователь говорит о блокировках, ограничениях, недоступных соцсетях или медиа.",
-			"phrases": [
-				"заблокировали", "блокировка", "обход блокировки", "не пускает на сайт",
+			"direct_phrases": [
+				"заблокировали", "обход блокировки", "не пускает на сайт",
 				"сайт заблочили", "приложение не открывается", "сервис умер",
-				"опять все заблокировали", "ограничили доступ",
+				"опять все заблокировали", "ограничили доступ", "ркн блочит",
+				"белые списки",
+			],
+			"indirect_phrases": [
+				"ркн", "блокировка", "блокировки", "белые списки", "запрет",
+				"ограничение", "ограничили",
 			],
 		},
 	}
 	created_or_updated = 0
 	for name, data in defaults.items():
 		intent_id = upsert_trigger_intent(name, data["description"], "openai", "", 1, 1)
-		add_intent_phrases(intent_id, data["phrases"])
+		add_intent_phrases(intent_id, data.get("direct_phrases", []), match_type="direct")
+		add_intent_phrases(intent_id, data.get("indirect_phrases", []), match_type="indirect")
 		created_or_updated += 1
 	return created_or_updated
 
@@ -501,7 +586,7 @@ def build_full_trigger_export_text() -> str:
 		if intent.get("description"):
 			lines.append(f"  Описание: {intent['description']}")
 		for phrase in intent.get("phrases", []):
-			lines.append(f"  - ({phrase.get('match_type')}) {phrase.get('phrase')}")
+			lines.append(f"  - ({phrase_type_label(phrase.get('match_type'))}) {phrase.get('phrase')}")
 	lines.append("")
 
 	responses = fetch_global_responses()
@@ -513,6 +598,12 @@ def build_full_trigger_export_text() -> str:
 
 def semantic_analysis_enabled() -> bool:
 	return _as_bool(get_config_value("trigger_semantic_enabled", "False"))
+
+
+def phrase_type_label(match_type: str | None) -> str:
+	if is_indirect_match_type(match_type):
+		return "косвенная"
+	return "прямая"
 
 
 def semantic_threshold() -> float:
@@ -698,7 +789,13 @@ def evaluate_trigger_for_message(
 		return decision
 
 	if allow_semantic:
+		indirect_decision = best_indirect_marker_match(message_text, intent_rows)
+		if not indirect_decision.indirect_keyword:
+			return indirect_decision
 		semantic_decision = classify_semantic_intent(message_text)
+		semantic_decision.indirect_keyword = indirect_decision.indirect_keyword
+		if semantic_decision.matched and not semantic_decision.keyword:
+			semantic_decision.keyword = indirect_decision.indirect_keyword
 		if semantic_decision.matched and respect_cooldown and chat_id is not None and sender_id is not None:
 			reason = get_trigger_cooldown_reason(chat_id, sender_id, semantic_decision.cooldown_key)
 			if reason:

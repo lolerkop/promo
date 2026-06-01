@@ -28,6 +28,7 @@ from services.trigger_engine import (
 	get_intent_phrase,
 	get_trigger_intent,
 	import_global_triggers_from_text,
+	phrase_type_label,
 	semantic_analysis_enabled,
 	set_trigger_semantic_enabled,
 	update_trigger_intent,
@@ -293,6 +294,12 @@ def _intents_keyboard() -> InlineKeyboardMarkup:
 	return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def _phrase_type_counts(phrases: list[dict]) -> tuple[int, int]:
+	direct = sum(1 for item in phrases if phrase_type_label(item.get("match_type")) == "прямая")
+	indirect = sum(1 for item in phrases if phrase_type_label(item.get("match_type")) == "косвенная")
+	return direct, indirect
+
+
 def _intent_detail_text(intent: dict) -> str:
 	status = "включено" if int(intent.get("is_active") or 0) else "выключено"
 	semantic = "включен" if int(intent.get("semantic_enabled") or 0) else "выключен"
@@ -302,7 +309,11 @@ def _intent_detail_text(intent: dict) -> str:
 	if intent.get("response_type") == "predefined":
 		answer_text = answer or "-"
 	phrases = intent.get("phrases") or []
-	preview_phrases = "\n".join(f"• {html.escape(item['phrase'])}" for item in phrases[:12])
+	direct_count, indirect_count = _phrase_type_counts(phrases)
+	preview_phrases = "\n".join(
+		f"• [{phrase_type_label(item.get('match_type'))}] {html.escape(item['phrase'])}"
+		for item in phrases[:12]
+	)
 	if len(phrases) > 12:
 		preview_phrases += f"\n...и еще {len(phrases) - 12}"
 	if not preview_phrases:
@@ -313,7 +324,7 @@ def _intent_detail_text(intent: dict) -> str:
 		f"<b>Статус:</b> {status}\n"
 		f"<b>AI-смысл:</b> {semantic}\n"
 		f"<b>Тип ответа:</b> {response_type}\n"
-		f"<b>Фраз:</b> {len(phrases)}\n\n"
+		f"<b>Фраз:</b> {len(phrases)} (прямых: <b>{direct_count}</b>, косвенных: <b>{indirect_count}</b>)\n\n"
 		f"<b>Описание:</b>\n{html.escape(intent.get('description') or '-')}\n\n"
 		f"<b>Ответ:</b>\n<pre>{html.escape(answer_text[:900])}</pre>\n\n"
 		f"<b>Фразы:</b>\n{preview_phrases}"
@@ -338,7 +349,10 @@ def _intent_detail_keyboard(intent: dict) -> InlineKeyboardMarkup:
 			InlineKeyboardButton(text="Ответ: текст", callback_data=f"response_intent_answer_start:{intent_id}"),
 		],
 		[
-			InlineKeyboardButton(text="Добавить фразы", callback_data=f"response_intent_add_phrases_start:{intent_id}"),
+			InlineKeyboardButton(text="Добавить прямые", callback_data=f"response_intent_add_phrases_start:{intent_id}:direct"),
+			InlineKeyboardButton(text="Добавить косвенные", callback_data=f"response_intent_add_phrases_start:{intent_id}:indirect"),
+		],
+		[
 			InlineKeyboardButton(text="Фразы/удаление", callback_data=f"response_intent_phrases:{intent_id}"),
 		],
 		[InlineKeyboardButton(text="Удалить намерение", callback_data=f"response_intent_delete_confirm:{intent_id}")],
@@ -348,14 +362,18 @@ def _intent_detail_keyboard(intent: dict) -> InlineKeyboardMarkup:
 
 def _intent_phrases_text(intent: dict) -> str:
 	phrases = intent.get("phrases") or []
+	direct_count, indirect_count = _phrase_type_counts(phrases)
 	lines = [
 		f"<b>Фразы намерения:</b> {html.escape(intent.get('name') or '-')}",
-		f"Всего: <b>{len(phrases)}</b>",
+		f"Всего: <b>{len(phrases)}</b> | прямых: <b>{direct_count}</b> | косвенных: <b>{indirect_count}</b>",
 		"",
 		"Нажмите на фразу, чтобы удалить ее.",
 	]
 	for index, phrase in enumerate(phrases[:35], start=1):
-		lines.append(f"{index}. <code>{html.escape(phrase['phrase'])}</code>")
+		lines.append(
+			f"{index}. [{phrase_type_label(phrase.get('match_type'))}] "
+			f"<code>{html.escape(phrase['phrase'])}</code>"
+		)
 	if len(phrases) > 35:
 		lines.append(f"\n...и еще {len(phrases) - 35}. Полный список есть в экспорте.")
 	return "\n".join(lines)
@@ -370,11 +388,14 @@ def _intent_phrases_keyboard(intent: dict) -> InlineKeyboardMarkup:
 			label = label[:39] + "..."
 		buttons.append([
 			InlineKeyboardButton(
-				text=f"Удалить: {label}",
+				text=f"Удалить [{phrase_type_label(phrase.get('match_type'))}]: {label}",
 				callback_data=f"response_intent_phrase_delete_confirm:{phrase['id']}:{intent_id}",
 			)
 		])
-	buttons.append([InlineKeyboardButton(text="Добавить фразы", callback_data=f"response_intent_add_phrases_start:{intent_id}")])
+	buttons.append([
+		InlineKeyboardButton(text="Добавить прямые", callback_data=f"response_intent_add_phrases_start:{intent_id}:direct"),
+		InlineKeyboardButton(text="Добавить косвенные", callback_data=f"response_intent_add_phrases_start:{intent_id}:indirect"),
+	])
 	buttons.append([InlineKeyboardButton(text="Назад к намерению", callback_data=f"response_intent_view:{intent_id}")])
 	return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -863,18 +884,24 @@ async def cb_response_intent_add_phrases_start(callback: CallbackQuery, state: F
 		await callback.answer("У вас нет прав.")
 		return
 	try:
-		intent_id = int(callback.data.split(":", 1)[1])
+		parts = callback.data.split(":")
+		intent_id = int(parts[1])
+		match_type = parts[2] if len(parts) > 2 else "direct"
 	except (ValueError, IndexError):
 		await callback.answer("Некорректный ID.", show_alert=True)
 		return
+	if match_type not in {"direct", "indirect"}:
+		match_type = "direct"
 	intent = get_trigger_intent(intent_id, include_phrases=False)
 	if not intent:
 		await callback.answer("Намерение не найдено.", show_alert=True)
 		return
-	await state.update_data(intent_id=intent_id)
+	await state.update_data(intent_id=intent_id, phrase_match_type=match_type)
+	type_text = "прямые фразы" if match_type == "direct" else "косвенные маркеры"
 	await callback.message.edit_text(
-		"Отправьте фразы для намерения: текстом или .txt файлом.\n\n"
-		"Каждая строка - отдельная фраза. Пустые строки и строки с # игнорируются.",
+		f"Отправьте {type_text} для намерения: текстом или .txt файлом.\n\n"
+		"Каждая строка - отдельная фраза. Пустые строки и строки с # игнорируются.\n\n"
+		"Прямые фразы сразу запускают ответ. Косвенные только допускают сообщение к AI-проверке смысла.",
 		reply_markup=cancel_action_keyboard(),
 	)
 	await state.set_state("waiting_for_intent_add_phrases")
@@ -888,6 +915,7 @@ def _parse_phrase_lines(text: str) -> list[str]:
 async def _save_intent_phrases_from_text(message: Message, state: FSMContext, text: str):
 	data = await state.get_data()
 	intent_id = data.get("intent_id")
+	match_type = data.get("phrase_match_type", "direct")
 	if not intent_id:
 		await message.answer("Намерение не найдено. Начните заново.", reply_markup=responses_menu_keyboard())
 		await state.clear()
@@ -896,10 +924,11 @@ async def _save_intent_phrases_from_text(message: Message, state: FSMContext, te
 	if not phrases:
 		await message.answer("Фразы не найдены.", reply_markup=cancel_action_keyboard())
 		return
-	added = add_intent_phrases(int(intent_id), phrases)
+	added = add_intent_phrases(int(intent_id), phrases, match_type=match_type)
 	intent = get_trigger_intent(int(intent_id))
 	await state.clear()
 	await message.answer(
+		f"Тип: <b>{phrase_type_label(match_type)}</b>\n"
 		f"Фразы обработаны: <b>{len(phrases)}</b>\nДобавлено новых: <b>{added}</b>\n\n"
 		+ _intent_detail_text(intent),
 		reply_markup=_intent_detail_keyboard(intent),
@@ -1080,6 +1109,7 @@ async def handle_intent_description(message: Message, state: FSMContext):
 	await state.update_data(intent_description=message.text.strip())
 	await message.answer(
 		"Введите ключевые фразы для этого намерения, каждую с новой строки.\n"
+		"Они будут сохранены как прямые фразы. Косвенные маркеры можно добавить из карточки намерения.\n"
 		"Если нужны только смысловые AI-срабатывания, отправьте <code>-</code>.",
 		reply_markup=cancel_action_keyboard()
 	)
@@ -1098,7 +1128,7 @@ async def handle_intent_phrases(message: Message, state: FSMContext):
 	phrases = []
 	if message.text.strip() != "-":
 		phrases = [line.strip() for line in message.text.splitlines() if line.strip()]
-	added = add_intent_phrases(intent_id, phrases) if phrases else 0
+	added = add_intent_phrases(intent_id, phrases, match_type="direct") if phrases else 0
 	await state.clear()
 	await message.answer(
 		f"Намерение сохранено.\n"
