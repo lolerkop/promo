@@ -22,6 +22,7 @@ DB_MIGRATIONS = (
 	(3, "account_entity_memberships"),
 	(4, "telegram_api_credentials"),
 	(5, "advanced_triggers"),
+	(6, "trigger_reply_threads"),
 )
 _current_workspace_id = contextvars.ContextVar("current_workspace_id", default=None)
 
@@ -465,6 +466,23 @@ def create_tables():
 	""")
 
 	c.execute("""
+	CREATE TABLE IF NOT EXISTS trigger_reply_threads (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		chat_id INTEGER NOT NULL,
+		source_user_id INTEGER NOT NULL,
+		source_message_id INTEGER NOT NULL,
+		bot_account_id INTEGER,
+		bot_user_id INTEGER,
+		bot_message_id INTEGER NOT NULL,
+		trigger_details TEXT,
+		followup_sent INTEGER DEFAULT 0,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		UNIQUE(chat_id, bot_message_id)
+	)
+	""")
+
+	c.execute("""
 	CREATE TABLE IF NOT EXISTS templates (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		templates TEXT NOT NULL
@@ -682,6 +700,29 @@ def _migration_advanced_triggers(cursor):
 	))
 
 
+def _migration_trigger_reply_threads(cursor):
+	cursor.execute("""
+		CREATE TABLE IF NOT EXISTS trigger_reply_threads (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			chat_id INTEGER NOT NULL,
+			source_user_id INTEGER NOT NULL,
+			source_message_id INTEGER NOT NULL,
+			bot_account_id INTEGER,
+			bot_user_id INTEGER,
+			bot_message_id INTEGER NOT NULL,
+			trigger_details TEXT,
+			followup_sent INTEGER DEFAULT 0,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			UNIQUE(chat_id, bot_message_id)
+		)
+	""")
+	cursor.execute(
+		"CREATE INDEX IF NOT EXISTS idx_trigger_reply_threads_lookup "
+		"ON trigger_reply_threads(chat_id, bot_message_id, source_user_id, followup_sent)"
+	)
+
+
 def run_migrations():
 	migration_handlers = {
 		1: _migration_runtime_indexes,
@@ -689,6 +730,7 @@ def run_migrations():
 		3: _migration_account_entity_memberships,
 		4: _migration_telegram_api_credentials,
 		5: _migration_advanced_triggers,
+		6: _migration_trigger_reply_threads,
 	}
 	conn = get_db_connection()
 	c = conn.cursor()

@@ -5,7 +5,7 @@ import os
 from aiogram.types import BotCommand
 
 from db import get_config_value, set_config_value, update_all_tables
-from services.default_prompts import DEFAULT_TRIGGER_AI_PROMPT
+from services.default_prompts import DEFAULT_TRIGGER_AI_PROMPT, DEFAULT_TRIGGER_FOLLOWUP_PROMPT
 from services.error_log_handler import install_error_log_handler
 
 from .bot_instance import (DEFAULT_AI_BASE_PROMPT, DEFAULT_AI_MAX_TOKENS,
@@ -107,6 +107,7 @@ async def main_bot_polling_task():
 		"account_auto_check_interval_minutes": "720"
 	}
 	default_configs["ai_trigger_prompt"] = DEFAULT_TRIGGER_AI_PROMPT
+	default_configs["ai_trigger_followup_prompt"] = DEFAULT_TRIGGER_FOLLOWUP_PROMPT
 	for key, value in default_configs.items():
 		if get_config_value(key) is None:
 			set_config_value(key, value)

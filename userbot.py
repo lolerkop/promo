@@ -38,6 +38,14 @@ from services.rotation import (get_accounts_ordered_for_cycle as rotation_get_ac
                                get_next_account_in_cycle as rotation_get_next_account_in_cycle,
                                record_account_cycle_success as rotation_record_account_cycle_success)
 from services.default_prompts import DEFAULT_TRIGGER_AI_PROMPT as UPDATED_DEFAULT_TRIGGER_AI_PROMPT
+from services.trigger_followup import (
+		classify_followup_relevance_with_ai,
+		generate_trigger_followup_response,
+		get_trigger_reply_thread,
+		mark_trigger_followup_sent,
+		quick_followup_relevance,
+		record_trigger_reply_thread,
+)
 from services.trigger_engine import (evaluate_trigger_for_message,
                                      record_trigger_delivery)
 from services.trigger_matching import (chat_id_variants as trigger_chat_id_variants,
@@ -510,6 +518,7 @@ async def send_rotating_chat_reply(event, text: str, user_id, cycle_name: str, a
 						return {
 								"message_id": getattr(sent_message, "id", None),
 								"account_id": reply_account_id,
+								"bot_user_id": reply_data.get("user_id"),
 								"account_label": reply_label,
 								"chat_username": chat_username,
 								"chat_title": chat_title,
@@ -695,6 +704,15 @@ async def on_new_message_handler(event, client_obj, client_data):
 										)
 										if sent:
 												record_trigger_delivery(chat_id, sender_id, decision.cooldown_key)
+												record_trigger_reply_thread(
+														chat_id=chat_id,
+														source_user_id=sender_id,
+														source_message_id=event.message.id,
+														bot_account_id=sent.get("account_id"),
+														bot_user_id=sent.get("bot_user_id"),
+														bot_message_id=sent.get("message_id"),
+														trigger_details=decision.action_details,
+												)
 												try:
 														append_trigger_reply_report(
 																chat_id=chat_id,
@@ -1024,6 +1042,14 @@ async def _create_client_with_handlers(acc_row_data: dict, workspace_id: str = N
 								try:
 										replied_to_msg = await event.get_reply_message()
 										if replied_to_msg and replied_to_msg.sender_id == ccd.get("user_id"):
+												trigger_followup_handled = await _handle_trigger_followup_logic(
+														event,
+														current_client_obj,
+														ccd,
+														replied_to_msg,
+												)
+												if trigger_followup_handled:
+														return
 												await _handle_dialogue_logic(event, current_client_obj, ccd)
 												return
 								except Exception as e:
@@ -1156,6 +1182,139 @@ async def _handle_dialogue_logic(event, current_client_obj, current_client_data_
 													account_info=f"<code>{account_label_dialogue}</code> (ID: {account_db_id_dialogue})",
 													event_details=f"Чат: <code>{event.chat_id if event else 'N/A'}</code>, Пользователь: <code>{event.sender_id if event else 'N/A'}</code>\nСообщение: <pre>{html.escape(raw_text_dialogue_err[:200])}</pre>",
 													response_info="Действие не выполнено", error_info=str(e_dialogue_main))
+
+
+async def _handle_trigger_followup_logic(event, current_client_obj, current_client_data_dict, replied_to_msg) -> bool:
+		account_db_id = current_client_data_dict.get("id")
+		account_label = current_client_data_dict.get("label", "N/A")
+		thread = await asyncio.to_thread(get_trigger_reply_thread, event.chat_id, replied_to_msg.id)
+		if not thread:
+				return False
+
+		user_text = event.raw_text if hasattr(event, "raw_text") else ""
+		if int(thread.get("source_user_id") or 0) != int(event.sender_id or 0):
+				logging.info(
+						"TRIGGER_FOLLOWUP: ignored reply from user %s to bot message %s; expected user %s.",
+						event.sender_id,
+						replied_to_msg.id,
+						thread.get("source_user_id"),
+				)
+				return True
+
+		if int(thread.get("followup_sent") or 0):
+				logging.info(
+						"TRIGGER_FOLLOWUP: ignored duplicate reply in chat %s to bot message %s.",
+						event.chat_id,
+						replied_to_msg.id,
+				)
+				return True
+
+		local_decision, relevance_reason = quick_followup_relevance(user_text)
+		confidence = 1.0 if local_decision is True else 0.0
+		if local_decision is False:
+				logging.info(
+						"TRIGGER_FOLLOWUP: ignored off-topic/provocation reply in chat %s. reason=%s text=%r",
+						event.chat_id,
+						relevance_reason,
+						(user_text or "")[:120],
+				)
+				return True
+
+		if local_decision is None:
+				is_relevant, confidence, relevance_reason = await asyncio.to_thread(
+						classify_followup_relevance_with_ai,
+						user_text,
+						getattr(replied_to_msg, "text", "") or "",
+				)
+				if not is_relevant:
+						logging.info(
+								"TRIGGER_FOLLOWUP: AI rejected reply in chat %s. confidence=%.2f reason=%s",
+								event.chat_id,
+								confidence,
+								relevance_reason,
+						)
+						return True
+
+		response_text = await asyncio.to_thread(
+				generate_trigger_followup_response,
+				user_text,
+				getattr(replied_to_msg, "text", "") or "",
+		)
+		if not response_text:
+				logging.info(
+						"TRIGGER_FOLLOWUP: generator returned empty/SKIP in chat %s. reason=%s",
+						event.chat_id,
+						relevance_reason,
+				)
+				return True
+
+		delay = random.randint(REPLY_DELAY_MIN, REPLY_DELAY_MAX)
+		logging.info(
+				"TRIGGER_FOLLOWUP: account %s (ID: %s) will answer once in %ss. reason=%s confidence=%.2f",
+				account_label,
+				account_db_id,
+				delay,
+				relevance_reason,
+				confidence,
+		)
+		await asyncio.sleep(delay)
+
+		try:
+				sent_message = await current_client_obj.send_message(
+						entity=event.chat_id,
+						message=response_text,
+						reply_to=event.message.id,
+						parse_mode="html",
+						link_preview=False,
+				)
+				await asyncio.to_thread(mark_trigger_followup_sent, int(thread["id"]))
+				add_analytics_log(
+						account_id=account_db_id,
+						action_type="trigger_followup_reply",
+						details=f"Chat: {event.chat_id}, ReplyTo: {event.message.id}, User: {event.sender_id}, Reason: {relevance_reason}",
+						success=True,
+				)
+
+				chat_username = None
+				chat_title = None
+				try:
+						chat_entity = await event.get_chat()
+						chat_username = getattr(chat_entity, "username", None)
+						chat_title = getattr(chat_entity, "title", None)
+				except Exception as chat_info_error:
+						logging.debug(f"TRIGGER_FOLLOWUP: could not read chat info for report: {chat_info_error}")
+
+				try:
+						append_trigger_reply_report(
+								chat_id=event.chat_id,
+								source_message_id=replied_to_msg.id,
+								reply_message_id=getattr(sent_message, "id", None),
+								response_text=response_text,
+								account_id=account_db_id,
+								account_label=account_label,
+								trigger_details=f"Trigger follow-up: {thread.get('trigger_details') or 'trigger_reply'}",
+								original_text=user_text,
+								chat_username=chat_username,
+								chat_title=chat_title,
+						)
+				except Exception as report_error:
+						logging.error(f"TRIGGER_FOLLOWUP: failed to write report: {report_error}")
+				return True
+		except Exception as send_error:
+				logging.error(
+						"TRIGGER_FOLLOWUP: failed to send follow-up in chat %s by account %s: %s",
+						event.chat_id,
+						account_label,
+						send_error,
+						exc_info=True,
+				)
+				add_analytics_log(
+						account_id=account_db_id,
+						action_type="trigger_followup_reply_fail",
+						details=f"Chat: {event.chat_id}, ReplyTo: {event.message.id}, Error: {type(send_error).__name__}: {send_error}",
+						success=False,
+				)
+				return True
 
 
 async def _run_client_until_disconnected_in_workspace(client: TelegramClient, workspace_id: str):
