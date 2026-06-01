@@ -44,10 +44,13 @@ def general_settings_menu_keyboard() -> InlineKeyboardMarkup:
 
 	listen_all_mode = get_config_value("listen_all", "True").lower() == 'true'
 	listen_all_text = "Все чаты" if listen_all_mode else "Только из БД"
+	auto_join_linked_groups = get_config_value("auto_join_linked_discussion_groups", "True").lower() == "true"
+	auto_join_linked_groups_text = "Вкл" if auto_join_linked_groups else "Выкл"
 
 	buttons = [
 		[InlineKeyboardButton(text=f"Режим подписки: {sub_mode_text}", callback_data="toggle_subscription_mode")],
 		[InlineKeyboardButton(text=f"Режим отслеживания: {listen_all_text}", callback_data="toggle_listen_all")],
+		[InlineKeyboardButton(text=f"Автовступление в группы: {auto_join_linked_groups_text}", callback_data="toggle_auto_join_linked_groups")],
 		[InlineKeyboardButton(text="Шаблоны", callback_data="view_templates")],
 		[InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="back_to_main_menu")]
 	]
@@ -371,3 +374,25 @@ async def cb_toggle_listen_all(callback: CallbackQuery, state: FSMContext):
 		reply_markup=general_settings_menu_keyboard()
 	)
 	await callback.answer("Режим отслеживания изменен.")
+
+
+@dp.callback_query(F.data == "toggle_auto_join_linked_groups")
+async def cb_toggle_auto_join_linked_groups(callback: CallbackQuery, state: FSMContext):
+	if not user_is_allowed(callback.from_user.id):
+		await callback.answer("Нет прав.")
+		return
+
+	current_status = get_config_value("auto_join_linked_discussion_groups", "True").lower() == "true"
+	new_status_str = "False" if current_status else "True"
+	set_config_value("auto_join_linked_discussion_groups", new_status_str)
+
+	logging.info(
+		"Auto-join linked discussion groups changed to %s by admin %s",
+		new_status_str,
+		callback.from_user.id,
+	)
+	await callback.message.edit_text(
+		"Настройки обновлены.",
+		reply_markup=general_settings_menu_keyboard()
+	)
+	await callback.answer("Автовступление в группы изменено.")

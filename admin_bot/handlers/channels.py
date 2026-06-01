@@ -170,20 +170,37 @@ async def handle_channel_identifier(message: Message, state: FSMContext):
             f"Channel '{html.escape(entity_title_display)}' was not added: no account could join it.")
         return
 
-    await message.answer("Checking and processing linked discussion group, if one exists...")
-    asyncio.create_task(
-        auto_handle_linked_chat_and_add_to_groups(
-            admin_chat_id=admin_chat_id,
-            main_channel_info=channel_info,
-            client_to_use=channel_info['client_obj']
-        )
+    await message.answer(
+        "Checking and processing linked discussion group, if one exists. "
+        "If auto-join is enabled, this can take a few minutes because account joins are delayed."
     )
+    linked_result = await auto_handle_linked_chat_and_add_to_groups(
+        admin_chat_id=admin_chat_id,
+        main_channel_info=channel_info,
+        client_to_use=channel_info['client_obj']
+    )
+
+    linked_stats = linked_result.get("stats") or {}
+    linked_info = linked_result.get("linked_chat_info") or {}
+    if linked_stats.get("auto_join_disabled"):
+        linked_report = "Linked group: found, auto-join disabled."
+    elif linked_result.get("success") and linked_info:
+        linked_report = (
+            f"Linked group: {html.escape(str(linked_info.get('title') or linked_info.get('id')))}\n"
+            f"Linked group target: {linked_stats.get('target_members', 'N/A')}\n"
+            f"Linked group existing before run: {linked_stats.get('existing_members', 0)}\n"
+            f"Linked group joined OK: {linked_stats.get('success', 0)}\n"
+            f"Linked group errors: {linked_stats.get('failed', 0)}"
+        )
+    else:
+        linked_report = f"Linked group: not processed ({html.escape(str(linked_result.get('message') or 'not found'))})."
 
     final_report = (
         f"<b>Channel add report for '{html.escape(entity_title_display)}':</b>\n\n"
         f"Subscribed accounts: {channel_subs_stats['success']}\n"
         f"Subscription errors: {channel_subs_stats['failed']}\n"
-        f"Deleted inactive accounts: {channel_subs_stats['deleted']}"
+        f"Deleted inactive accounts: {channel_subs_stats['deleted']}\n\n"
+        f"{linked_report}"
     )
 
     await message.answer(final_report, reply_markup=main_menu_keyboard())

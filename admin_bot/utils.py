@@ -801,6 +801,48 @@ def _active_linked_group_member_count(group_id: int) -> int:
     return len(_get_entity_member_account_ids("group", group_id))
 
 
+def _auto_join_linked_discussion_groups_enabled() -> bool:
+    return get_config_value("auto_join_linked_discussion_groups", "True").lower() == "true"
+
+
+def _upsert_linked_group_in_db(linked_chat_info: dict, assigned_account_id: int | None = None) -> None:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        canonical_group_id = int(linked_chat_info["id"])
+        group_id_variants = _entity_id_variants(canonical_group_id)
+        if assigned_account_id is None:
+            cursor.execute(
+                f"SELECT id, assigned_account_id FROM groups WHERE id IN ({','.join('?' for _ in group_id_variants)})",
+                group_id_variants
+            )
+            for existing_row in cursor.fetchall():
+                if existing_row["assigned_account_id"] is not None:
+                    assigned_account_id = existing_row["assigned_account_id"]
+                    break
+
+        cursor.execute(
+            f"DELETE FROM groups WHERE id IN ({','.join('?' for _ in group_id_variants)}) AND id != ?",
+            (*group_id_variants, canonical_group_id)
+        )
+
+        cursor.execute(
+            "INSERT OR REPLACE INTO groups (id, username, title, enabled, assigned_account_id) VALUES (?, ?, ?, 1, ?)",
+            (
+                canonical_group_id,
+                linked_chat_info.get("username"),
+                linked_chat_info.get("title"),
+                assigned_account_id,
+            )
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 async def _resolve_linked_chat_entity_for_client(
         client: TelegramClient,
         main_channel_id: int,
@@ -1843,46 +1885,93 @@ async def auto_handle_linked_chat_and_add_to_groups(admin_chat_id: int, main_cha
     identifier_for_join_call = linked_chat_info_dict["username"] if linked_chat_info_dict["username"] else str(
         linked_chat_peer_id)
 
-    if notify:
-        await bot.send_message(admin_chat_id,
-                               f"Найдена связанная группа: <b>{html.escape(linked_chat_display_name)}</b> (ID: {linked_chat_info_dict['id']}). Подписываю аккаунты используя '{identifier_for_join_call}'...")
+    if not _auto_join_linked_discussion_groups_enabled():
+        if notify:
+            await bot.send_message(
+                admin_chat_id,
+                (
+                    f"Найдена связанная группа: <b>{html.escape(linked_chat_display_name)}</b> "
+                    f"(ID: {linked_chat_info_dict['id']}).\n"
+                    "Автовступление в группы обсуждений выключено в общих настройках. "
+                    "Сохранил linked_chat_id у канала, подписку в группу не запускаю."
+                )
+            )
+        return {
+            "success": True,
+            "message": "Автовступление в связанную группу выключено.",
+            "linked_chat_info": linked_chat_info_dict,
+            "stats": {"auto_join_disabled": True, "success": 0, "failed": 0, "deleted": 0, "joined_account_ids": []},
+        }
 
-    stats, assigned_account_id = await subscribe_linked_chat_for_channel_accounts(
-        admin_chat_id=admin_chat_id,
-        main_channel_id=main_channel_id,
-        linked_chat_id=linked_chat_info_dict["id"],
-        linked_chat_display_name=linked_chat_display_name,
-        notify=notify,
-        progress_hook=progress_hook,
-    )
+    try:
+        _upsert_linked_group_in_db(linked_chat_info_dict)
+        logging.info(
+            f"Связанная группа {linked_chat_display_name} (ID: {linked_chat_info_dict['id']}) заранее добавлена/обновлена в таблице 'groups'.")
+    except Exception as e_db:
+        logging.error(f"Ошибка предварительного добавления связанной группы {linked_chat_display_name} в БД: {e_db}")
+        if notify:
+            await bot.send_message(
+                admin_chat_id,
+                f"⚠️ Не удалось добавить связанную группу {html.escape(linked_chat_display_name)} в раздел 'Группы': Ошибка БД."
+            )
+        return {
+            "success": False,
+            "message": "Ошибка при предварительном добавлении связанной группы в БД.",
+            "linked_chat_info": linked_chat_info_dict,
+            "stats": {"success": 0, "failed": 0, "deleted": 0, "joined_account_ids": []},
+        }
+
     if notify:
+        target_min = _linked_group_accounts_min()
+        target_max = _linked_group_accounts_max()
         await bot.send_message(
             admin_chat_id,
             (
-                f"Linked group join report for <b>{html.escape(linked_chat_display_name)}</b>:\n"
-                f"OK: <b>{stats['success']}</b>\n"
-                f"Failed: <b>{stats['failed']}</b>\n"
-                f"Deleted inactive: <b>{stats['deleted']}</b>"
+                f"Найдена связанная группа: <b>{html.escape(linked_chat_display_name)}</b> "
+                f"(ID: {linked_chat_info_dict['id']}).\n"
+                f"Группа сохранена в БД. Подписываю аккаунты используя '{identifier_for_join_call}'. "
+                f"Для linked-групп действует лимит: {target_min}-{target_max} аккаунтов."
             )
         )
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    stats = _subscription_stats()
+    assigned_account_id = None
     try:
-        cursor.execute(
-            "INSERT OR REPLACE INTO groups (id, username, title, enabled, assigned_account_id) VALUES (?, ?, ?, 1, ?)",
-            (linked_chat_info_dict["id"], linked_chat_info_dict.get("username"), linked_chat_info_dict.get("title"),
-             assigned_account_id)
+        stats, assigned_account_id = await subscribe_linked_chat_for_channel_accounts(
+            admin_chat_id=admin_chat_id,
+            main_channel_id=main_channel_id,
+            linked_chat_id=linked_chat_info_dict["id"],
+            linked_chat_display_name=linked_chat_display_name,
+            notify=notify,
+            progress_hook=progress_hook,
         )
-        conn.commit()
         record_entity_memberships(
             stats.get('joined_account_ids', []),
             'group',
             linked_chat_info_dict["id"],
             identifier_for_join_call
         )
+        if assigned_account_id is not None:
+            _upsert_linked_group_in_db(linked_chat_info_dict, assigned_account_id)
         logging.info(
-            f"Связанная группа {linked_chat_display_name} (ID: {linked_chat_info_dict['id']}) добавлена/обновлена в таблице 'groups'.")
+            f"Связанная группа {linked_chat_display_name} (ID: {linked_chat_info_dict['id']}) синхронизирована. Stats: {stats}")
+        if notify:
+            existing_members = stats.get("existing_members", 0)
+            target_members = stats.get("target_members", _target_linked_group_account_count(
+                linked_chat_info_dict["id"], len(_get_active_clients_by_account_ids())
+            ))
+            await bot.send_message(
+                admin_chat_id,
+                (
+                    f"Linked group join report for <b>{html.escape(linked_chat_display_name)}</b>:\n"
+                    f"Saved in DB: <b>yes</b>\n"
+                    f"Existing before run: <b>{existing_members}</b>\n"
+                    f"Target: <b>{target_members}</b>\n"
+                    f"OK: <b>{stats['success']}</b>\n"
+                    f"Failed: <b>{stats['failed']}</b>\n"
+                    f"Deleted inactive: <b>{stats['deleted']}</b>"
+                )
+            )
         if notify:
             await send_ai_welcome_message_to_chat(
                 admin_chat_id=admin_chat_id,
@@ -1890,16 +1979,18 @@ async def auto_handle_linked_chat_and_add_to_groups(admin_chat_id: int, main_cha
                 target_chat_name=linked_chat_display_name,
                 entity_type="группу обсуждения"
             )
-    except Exception as e_db:
-        logging.error(f"Ошибка добавления связанной группы {linked_chat_display_name} в БД: {e_db}")
-        conn.rollback()
+    except Exception as e_join:
+        logging.error(f"Ошибка подписки на связанную группу {linked_chat_display_name}: {e_join}", exc_info=True)
         if notify:
-            await bot.send_message(admin_chat_id,
-                                   f"⚠️ Не удалось добавить связанную группу {html.escape(linked_chat_display_name)} в раздел 'Чаты': Ошибка БД.")
-        return {"success": False, "message": "Ошибка при добавлении связанной группы в БД.",
+            await bot.send_message(
+                admin_chat_id,
+                (
+                    f"⚠️ Связанная группа <b>{html.escape(linked_chat_display_name)}</b> сохранена в БД, "
+                    f"но подписка завершилась ошибкой: <code>{html.escape(type(e_join).__name__)}</code>."
+                )
+            )
+        return {"success": False, "message": "Ошибка при подписке на связанную группу.",
                 "linked_chat_info": linked_chat_info_dict, "stats": stats}
-    finally:
-        conn.close()
 
     return {"success": True, "linked_chat_info": linked_chat_info_dict, "stats": stats}
 

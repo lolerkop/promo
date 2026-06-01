@@ -99,6 +99,7 @@ async def main_bot_polling_task():
 		"linked_group_channel_gap_max_seconds": "15",
 		"linked_group_accounts_per_group_min": "5",
 		"linked_group_accounts_per_group_max": "7",
+		"auto_join_linked_discussion_groups": "True",
 		"use_ai": "True",
 		"maintenance_auto_checks_enabled": "1",
 		"proxy_auto_check_interval_minutes": "360",
