@@ -37,6 +37,7 @@ from services.proxy_repository import (get_account_proxy_block_reason,
 from services.rotation import (get_accounts_ordered_for_cycle as rotation_get_accounts_ordered_for_cycle,
                                get_next_account_in_cycle as rotation_get_next_account_in_cycle,
                                record_account_cycle_success as rotation_record_account_cycle_success)
+from services.default_prompts import DEFAULT_TRIGGER_AI_PROMPT as UPDATED_DEFAULT_TRIGGER_AI_PROMPT
 from services.trigger_engine import (evaluate_trigger_for_message,
                                      record_trigger_delivery)
 from services.trigger_matching import (chat_id_variants as trigger_chat_id_variants,
@@ -46,7 +47,7 @@ from services.trigger_matching import (chat_id_variants as trigger_chat_id_varia
 
 try:
 		from admin_bot.reporting_utils import send_report
-		from admin_bot.reporting_utils import append_auto_comment_report
+		from admin_bot.reporting_utils import append_auto_comment_report, append_trigger_reply_report
 except ImportError:
 		async def send_report(*args, **kwargs):
 				logging.error(
@@ -54,6 +55,9 @@ except ImportError:
 		def append_auto_comment_report(*args, **kwargs):
 				logging.error(
 						"Failed to import append_auto_comment_report from admin_bot.reporting_utils in userbot.py.")
+		def append_trigger_reply_report(*args, **kwargs):
+				logging.error(
+						"Failed to import append_trigger_reply_report from admin_bot.reporting_utils in userbot.py.")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 
@@ -79,6 +83,8 @@ DEFAULT_TRIGGER_AI_PROMPT = (
 	"Если человек жалуется на блокировки, связь, глушилки или неработающие сервисы - покажи понимание и предложи VPN как практичное решение. "
 	"Пиши 1-2 коротких предложения."
 )
+
+DEFAULT_TRIGGER_AI_PROMPT = UPDATED_DEFAULT_TRIGGER_AI_PROMPT
 
 CLEANUP_INTERVAL_SECONDS = 300
 POST_LOCK_TIMEOUT_SECONDS = 900
@@ -448,7 +454,7 @@ async def anti_spam_send_reply(event, text, user_id, current_account_id_for_log:
 
 async def send_rotating_chat_reply(event, text: str, user_id, cycle_name: str, action_details: str,
 																	 coordinator_account_id: int | None = None,
-																	 coordinator_label: str = "N/A") -> bool:
+																	 coordinator_label: str = "N/A") -> dict | None:
 		candidate_clients = get_accounts_ordered_for_cycle(cycle_name)
 		if not candidate_clients:
 				logging.warning(f"ROTATING_REPLY: no connected accounts for {cycle_name}.")
@@ -458,7 +464,7 @@ async def send_rotating_chat_reply(event, text: str, user_id, cycle_name: str, a
 						details=f"No connected accounts for chat {event.chat_id}",
 						success=False
 				)
-				return False
+				return None
 
 		delay = random.randint(REPLY_DELAY_MIN, REPLY_DELAY_MAX)
 		first_candidate = candidate_clients[0][1]
@@ -475,7 +481,7 @@ async def send_rotating_chat_reply(event, text: str, user_id, cycle_name: str, a
 				reply_account_id = reply_data.get("id")
 				reply_label = reply_data.get("label", reply_data.get("session_name", "N/A"))
 				try:
-						await reply_client.send_message(
+						sent_message = await reply_client.send_message(
 								entity=event.chat_id,
 								message=text,
 								reply_to=event.message.id,
@@ -493,7 +499,21 @@ async def send_rotating_chat_reply(event, text: str, user_id, cycle_name: str, a
 								f"ROTATING_REPLY: account {reply_label} (ID: {reply_account_id}) sent {action_details} "
 								f"in chat {event.chat_id} as reply to {event.message.id}."
 						)
-						return True
+						chat_username = None
+						chat_title = None
+						try:
+								chat_entity = await event.get_chat()
+								chat_username = getattr(chat_entity, "username", None)
+								chat_title = getattr(chat_entity, "title", None)
+						except Exception as chat_info_error:
+								logging.debug(f"ROTATING_REPLY: could not read chat info for report: {chat_info_error}")
+						return {
+								"message_id": getattr(sent_message, "id", None),
+								"account_id": reply_account_id,
+								"account_label": reply_label,
+								"chat_username": chat_username,
+								"chat_title": chat_title,
+						}
 				except Exception as e:
 						error_text = f"{reply_label} (ID: {reply_account_id}): {type(e).__name__}: {e}"
 						attempt_errors.append(error_text)
@@ -517,7 +537,7 @@ async def send_rotating_chat_reply(event, text: str, user_id, cycle_name: str, a
 				response_info=f"<pre>{html.escape((text or '')[:400])}</pre>",
 				error_info="\n".join(attempt_errors[-10:]) if attempt_errors else "No send attempts succeeded."
 		)
-		return False
+		return None
 
 
 async def on_private_message_handler(event, client_obj, client_data):
@@ -675,6 +695,21 @@ async def on_new_message_handler(event, client_obj, client_data):
 										)
 										if sent:
 												record_trigger_delivery(chat_id, sender_id, decision.cooldown_key)
+												try:
+														append_trigger_reply_report(
+																chat_id=chat_id,
+																source_message_id=event.message.id,
+																reply_message_id=sent.get("message_id"),
+																response_text=response_text,
+																account_id=sent.get("account_id"),
+																account_label=sent.get("account_label"),
+																trigger_details=decision.action_details,
+																original_text=event.raw_text,
+																chat_username=sent.get("chat_username"),
+																chat_title=sent.get("chat_title"),
+														)
+												except Exception as report_error:
+														logging.error(f"ON_NEW_MESSAGE: failed to write trigger reply report: {report_error}")
 								else:
 										logging.warning(
 												"ON_NEW_MESSAGE: trigger matched but response text is empty/error. source=%s keyword=%s intent=%s",

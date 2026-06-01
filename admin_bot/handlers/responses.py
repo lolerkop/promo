@@ -18,6 +18,7 @@ from ..keyboards import cancel_action_keyboard, main_menu_keyboard
 from ..prompt_files import read_prompt_document, send_prompt_preview_file
 from ..utils import user_is_allowed
 from services.prompt_text import PromptTextError
+from services.default_prompts import DEFAULT_TRIGGER_AI_PROMPT as UPDATED_DEFAULT_TRIGGER_AI_PROMPT
 from services.trigger_engine import (
 	build_full_trigger_export_text,
 	delete_intent_phrase,
@@ -49,6 +50,7 @@ DEFAULT_TRIGGER_AI_PROMPT = (
 DEFAULT_TRIGGER_AI_MODEL = "gpt-4o-mini"
 DEFAULT_TRIGGER_AI_TEMPERATURE = "0.8"
 DEFAULT_TRIGGER_AI_MAX_TOKENS = "120"
+DEFAULT_TRIGGER_AI_PROMPT = UPDATED_DEFAULT_TRIGGER_AI_PROMPT
 
 
 def _response_type_label(response_type: str | None) -> str:
